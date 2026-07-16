@@ -299,6 +299,47 @@ func TestSeriesStep(t *testing.T) {
 	}
 }
 
+func TestSeriesStepForRangeClampsToMaxPoints(t *testing.T) {
+	start := time.Unix(0, 0)
+	end := start.Add(28 * 24 * time.Hour)
+
+	got := seriesStepForRange(
+		&storepb.SeriesRequest{QueryHints: &storepb.QueryHints{StepMillis: int64((15 * time.Second) / time.Millisecond)}},
+		time.Minute,
+		start,
+		end,
+		11000,
+	)
+
+	want := minStepForMaxPoints(28*24*time.Hour, 11000)
+	if got != want {
+		t.Fatalf("seriesStepForRange() = %s, want %s", got, want)
+	}
+	if got < 3*time.Minute {
+		t.Fatalf("seriesStepForRange() = %s, want clamped multi-minute step", got)
+	}
+}
+
+func TestSeriesStepForRangeKeepsStepWhenUnderMaxPoints(t *testing.T) {
+	start := time.Unix(0, 0)
+	end := start.Add(time.Hour)
+
+	got := seriesStepForRange(&storepb.SeriesRequest{}, time.Minute, start, end, 11000)
+	if got != time.Minute {
+		t.Fatalf("seriesStepForRange() = %s, want 1m", got)
+	}
+}
+
+func TestSeriesStepForRangeCanDisableMaxPointsClamp(t *testing.T) {
+	start := time.Unix(0, 0)
+	end := start.Add(28 * 24 * time.Hour)
+
+	got := seriesStepForRange(&storepb.SeriesRequest{}, time.Minute, start, end, 0)
+	if got != time.Minute {
+		t.Fatalf("seriesStepForRange() = %s, want unclamped 1m", got)
+	}
+}
+
 func TestChunksFromModelSamples(t *testing.T) {
 	chunks, err := chunksFromModelSamples([]model.SamplePair{
 		{Timestamp: 1000, Value: 1},

@@ -51,6 +51,18 @@ the request into a PromQL HTTP `query_range` call and encodes returned samples a
 Thanos XOR chunks. If Thanos does not send a step hint, the connector uses
 `--query.series-step`, which defaults to `1m`.
 
+For long StoreAPI ranges, the connector also protects the backend from
+Prometheus-compatible `query_range` point limits. `--query.max-points-per-series`
+defaults to `11000`; when a requested range would exceed that many points per
+series, the connector increases only the backend `query_range` step enough to
+stay within the limit.
+
+Setting `--query.max-points-per-series=0` disables only this connector-side step
+clamp. It does not disable Mimir's own query limit, so long high-resolution
+queries can still fail with backend errors such as `exceeded maximum resolution
+of 11,000 points per timeseries`. Keep this value aligned with the backend limit,
+or increase the limit in Mimir if you need finer resolution over long ranges.
+
 ## gRPC TLS
 
 The connector can serve the Thanos QueryAPI, StoreAPI, and Info gRPC services

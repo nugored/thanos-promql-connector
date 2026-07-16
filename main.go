@@ -60,7 +60,10 @@ var (
 		"How often to refresh StoreAPI Info label sets from backend label values when query.announce-label is set.")
 	queryAnnounceLabelTimeout = flag.Duration("query.announce-label-timeout", 5*time.Second,
 		"Timeout for each announced label values fetch when query.announce-label is set.")
-	querySeriesStep  = flag.Duration("query.series-step", time.Minute, "Fallback step for StoreAPI series queries when Thanos does not send a query step hint.")
+	querySeriesStep = flag.Duration("query.series-step", time.Minute,
+		"Fallback step for StoreAPI series queries when Thanos does not send a query step hint.")
+	queryMaxPointsPerSeries = flag.Int("query.max-points-per-series", 11000,
+		"Maximum backend query_range points per series for StoreAPI series requests. The connector increases the backend step for long ranges when needed. Set 0 to disable connector-side clamping; backend limits still apply.")
 	connectorAddress = flag.String("connector-address", ":8081",
 		"Address on which to expose the query grpc server.")
 	grpcServerTLSCertFile = flag.String("grpc-server-tls-cert", "",
@@ -133,7 +136,7 @@ func (qs *queryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 	interval := v1.Range{
 		Start: start,
 		End:   end,
-		Step:  seriesStep(request, *querySeriesStep),
+		Step:  seriesStepForRange(request, *querySeriesStep, start, end, *queryMaxPointsPerSeries),
 	}
 	values, warnings, err := qs.queryBackendClient.QueryRange(server.Context(), selector, interval)
 	if err != nil {
@@ -536,6 +539,35 @@ func seriesStep(request *storepb.SeriesRequest, fallback time.Duration) time.Dur
 		return fallback
 	}
 	return time.Minute
+}
+
+func seriesStepForRange(request *storepb.SeriesRequest, fallback time.Duration, start, end time.Time, maxPoints int) time.Duration {
+	step := seriesStep(request, fallback)
+	if maxPoints <= 0 || !end.After(start) {
+		return step
+	}
+
+	minStep := minStepForMaxPoints(end.Sub(start), maxPoints)
+	if minStep > step {
+		return minStep
+	}
+	return step
+}
+
+func minStepForMaxPoints(rng time.Duration, maxPoints int) time.Duration {
+	if maxPoints <= 0 || rng <= 0 {
+		return 0
+	}
+	if maxPoints == 1 {
+		return rng
+	}
+
+	divisor := time.Duration(maxPoints - 1)
+	step := rng / divisor
+	if rng%divisor != 0 {
+		step++
+	}
+	return step
 }
 
 func timeFromMillis(ms int64) time.Time {

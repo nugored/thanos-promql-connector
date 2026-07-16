@@ -1,5 +1,5 @@
 IMAGE ?= santadepapaya/thanos-promql-connector
-TAG ?= 0.0.8
+TAG ?= 0.0.9
 PLATFORM ?= linux/amd64
 DOCKER ?= docker
 
