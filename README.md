@@ -50,3 +50,131 @@ When Thanos Querier calls the StoreAPI `Series` method, the connector translates
 the request into a PromQL HTTP `query_range` call and encodes returned samples as
 Thanos XOR chunks. If Thanos does not send a step hint, the connector uses
 `--query.series-step`, which defaults to `1m`.
+
+## Response Label Dropping
+
+Labels can be removed from QueryAPI and StoreAPI responses with `--query.drop-label`.
+This is useful with Mimir tenant federation when you already have another stable
+tenant-disambiguating label, for example an external label named `prometheus`:
+
+```bash
+--query.drop-label=__tenant_id__
+```
+
+## Backend External Labels
+
+The connector can read `global.external_labels` from a Prometheus-compatible
+`/api/v1/status/config` endpoint and apply them the same way Thanos sidecar does:
+external labels are advertised in StoreAPI `Info`, attached to returned series,
+and removed from StoreAPI matchers before backend queries are sent.
+
+```bash
+--query.external-labels
+```
+
+By default the connector reads external labels from `--query.target-url`. Use a
+separate source URL when the query target is not the Prometheus-compatible source
+whose external labels should be applied:
+
+```bash
+--query.external-labels \
+--query.external-labels-url=http://prometheus:9090
+```
+
+Do not enable this against a Mimir tenant-federation endpoint unless its
+`/api/v1/status/config` exposes the exact single external label set you want the
+connector to advertise.
+
+## FAQ
+› Does this mechanism allows to use Mimir as backend for thanos-promql-connector? I use Mimir Querier and it contains metrics from several Prometheuses with external labels set. Will the implemented logic
+  work?
+
+
+• Short answer: not the sidecar-style external-label mechanism.
+
+  For your setup:
+
+  Thanos Querier -> thanos-promql-connector -> Mimir Querier
+
+  with Mimir containing metrics from several Prometheuses, each already ingested with external label prometheus, the correct mechanism is:
+
+  --query.drop-label=__tenant_id__
+
+  and do not enable:
+
+  --query.external-labels
+
+  Why: Thanos sidecar external-label logic assumes one backend Prometheus behind one StoreAPI endpoint, with one stable global.external_labels set. Your Mimir Querier is a federated backend containing many
+  Prometheus sources, so there is no single external label set the connector should advertise. If the connector advertised one prometheus=... label globally, Thanos would incorrectly treat the whole Mimir-
+  backed endpoint as only that one source.
+
+  Your existing Mimir data already has prometheus on each series. The connector should preserve that per-series label and only drop Mimir’s federation label:
+
+  args:
+    - --query.target-url=http://mimir-querier:8080/prometheus
+    - '--query.header=X-Scope-OrgID=grazie|jetbrains-ai|k8s|tempo-grazie|tempo-k8s|fus'
+    - --query.drop-label=__tenant_id__
+
+  That should work as long as prometheus uniquely distinguishes the original Prometheus sources.
+
+
+› Is it right that now thanos-promql-connector parses external labels from Mimir and responds with this external labels to grpc requests from Thanos Queriers?
+
+
+• No, not with the current deployment.yaml.
+
+  The connector only parses and advertises backend external labels if you explicitly start it with:
+
+  --query.external-labels
+
+  Your current deployment args are:
+
+  - --query.target-url=http://mimir-querier:8080/prometheus
+  - '--query.header=X-Scope-OrgID=grazie|jetbrains-ai|k8s|tempo-grazie|tempo-k8s|fus'
+  - --query.drop-label=__tenant_id__
+
+  So right now it does not parse external labels from Mimir and does not advertise Mimir-derived external labels in StoreAPI Info.
+
+  It only:
+
+  1. Queries Mimir with your multi-tenant X-Scope-OrgID.
+  2. Receives series labels from Mimir.
+  3. Drops __tenant_id__.
+  4. Keeps your existing per-series prometheus label.
+
+  That is the behavior you want for Mimir federation. Do not enable --query.external-labels for this multi-Prometheus Mimir backend.
+
+
+› And --query.external-labels I use... when? In what cases?
+
+
+• Use --query.external-labels only when the connector is fronting one Prometheus-like backend that has one global external_labels set.
+
+  Good cases:
+
+  Thanos Querier -> thanos-promql-connector -> single Prometheus
+
+  or maybe:
+
+  Thanos Querier -> thanos-promql-connector -> single Prometheus-compatible proxy
+
+  where /api/v1/status/config returns:
+
+  global:
+    external_labels:
+      prometheus: prom-a
+      cluster: prod
+
+  Then the connector can behave like Thanos sidecar: advertise those labels to Thanos, attach them to returned series, and let Thanos route/filter by them.
+
+  Do not use it for your current case:
+
+  Thanos Querier -> connector -> Mimir Querier with many Prometheuses / tenants
+
+  because Mimir represents many sources, not one external label set. For that case, use only:
+
+  --query.drop-label=__tenant_id__
+
+  and rely on the existing per-series prometheus label already stored in Mimir.
+
+

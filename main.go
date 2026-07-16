@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,16 +35,24 @@ import (
 	apihttp "google.golang.org/api/transport/http"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"gopkg.in/yaml.v2"
 )
 
 var (
 	queryTargetURL  = flag.String("query.target-url", "", "PromQL HTTP API backend URL.")
 	queryHeaders    headerFlags
 	queryAuthScopes stringListFlag
+	queryDropLabels stringListFlag
 
-	queryAuthCredentialsFile = flag.String("query.auth.credentials-file", "", "Google auth credentials file for backend requests.")
-	querySeriesStep          = flag.Duration("query.series-step", time.Minute, "Fallback step for StoreAPI series queries when Thanos does not send a query step hint.")
-	connectorAddress         = flag.String("connector-address", ":8081",
+	queryAuthCredentialsFile    = flag.String("query.auth.credentials-file", "", "Google auth credentials file for backend requests.")
+	queryExternalLabels         = flag.Bool("query.external-labels", false, "Read and apply global.external_labels from the backend /api/v1/status/config endpoint, matching Thanos sidecar behavior.")
+	queryExternalLabelsURL      = flag.String("query.external-labels-url", "", "Prometheus-compatible base URL for reading external labels. Defaults to query.target-url when query.external-labels is enabled.")
+	queryExternalLabelsInterval = flag.Duration("query.external-labels.interval", 30*time.Second,
+		"How often to refresh external labels when query.external-labels is enabled.")
+	queryExternalLabelsTimeout = flag.Duration("query.external-labels.timeout", 5*time.Second,
+		"Timeout for each external labels fetch when query.external-labels is enabled.")
+	querySeriesStep  = flag.Duration("query.series-step", time.Minute, "Fallback step for StoreAPI series queries when Thanos does not send a query step hint.")
+	connectorAddress = flag.String("connector-address", ":8081",
 		"Address on which to expose the query grpc server.")
 	metricsAddress = flag.String("metrics-address", ":9090",
 		"Address on which to expose metrics")
@@ -51,9 +61,11 @@ var (
 func init() {
 	flag.Var(&queryHeaders, "query.header", "Static header to add to backend requests, in Name=Value or Name: Value format. May be repeated.")
 	flag.Var(&queryAuthScopes, "query.auth.scope", "Google auth OAuth scope for backend requests. May be repeated or comma-separated.")
+	flag.Var(&queryDropLabels, "query.drop-label", "Label to remove from query and StoreAPI responses. May be repeated or comma-separated.")
 }
 
 type queryBackendAPI interface {
+	Config(ctx context.Context) (v1.ConfigResult, error)
 	LabelNames(ctx context.Context, matches []string, startTime, endTime time.Time, opts ...v1.Option) ([]string, v1.Warnings, error)
 	LabelValues(ctx context.Context, label string, matches []string, startTime, endTime time.Time, opts ...v1.Option) (model.LabelValues, v1.Warnings, error)
 	Query(ctx context.Context, query string, ts time.Time, opts ...v1.Option) (model.Value, v1.Warnings, error)
@@ -63,13 +75,34 @@ type queryBackendAPI interface {
 
 type queryServer struct {
 	queryBackendClient queryBackendAPI
+	dropLabels         labelDropSet
+	externalLabels     func() labels.Labels
+}
+
+func newQueryServer(queryBackendClient queryBackendAPI, dropLabels []string, externalLabels func() labels.Labels) *queryServer {
+	if externalLabels == nil {
+		externalLabels = labels.EmptyLabels
+	}
+	return &queryServer{
+		queryBackendClient: queryBackendClient,
+		dropLabels:         newLabelDropSet(dropLabels),
+		externalLabels:     externalLabels,
+	}
 }
 
 func (qs *queryServer) Series(request *storepb.SeriesRequest, server storepb.Store_SeriesServer) error {
-	selector, err := querySelectorFromMatchers(request.Matchers)
+	externalLabels := qs.externalLabels()
+	match, matchers, err := matchesExternalLabels(request.Matchers, externalLabels)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
+	if !match {
+		return nil
+	}
+	if len(matchers) == 0 {
+		return status.Error(codes.InvalidArgument, "no matchers specified (excluding external labels)")
+	}
+	selector := querySelectorFromPromMatchers(matchers)
 
 	start := timeFromMillis(request.MinTime)
 	end := timeFromMillis(request.MaxTime)
@@ -106,7 +139,7 @@ func (qs *queryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 			return status.Error(codes.Internal, err.Error())
 		}
 		if err := server.Send(storepb.NewSeriesResponse(&storepb.Series{
-			Labels: zLabelsFromMetric(result.Metric),
+			Labels: qs.dropLabels.zLabelsFromMetric(result.Metric, externalLabels, request.WithoutReplicaLabels),
 			Chunks: chunks,
 		})); err != nil {
 			return err
@@ -121,26 +154,58 @@ func (qs *queryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 }
 
 func (qs *queryServer) LabelNames(ctx context.Context, request *storepb.LabelNamesRequest) (*storepb.LabelNamesResponse, error) {
-	matches, err := labelAPISelectorsFromMatchers(request.Matchers)
+	externalLabels := qs.externalLabels()
+	match, promMatchers, err := matchesExternalLabels(request.Matchers, externalLabels)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	if !match {
+		return &storepb.LabelNamesResponse{}, nil
+	}
+	matches := labelAPISelectorsFromPromMatchers(promMatchers)
 	req, warnings, err := qs.queryBackendClient.LabelNames(ctx, matches, timeFromMillis(request.Start), timeFromMillis(request.End))
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 	return &storepb.LabelNamesResponse{
-		Names:    req,
+		Names:    qs.dropLabels.labelNames(req, externalLabels, request.WithoutReplicaLabels),
 		Warnings: warnings,
 		Hints:    nil,
 	}, nil
 }
 
 func (qs *queryServer) LabelValues(ctx context.Context, request *storepb.LabelValuesRequest) (*storepb.LabelValuesResponse, error) {
-	matches, err := labelAPISelectorsFromMatchers(request.Matchers)
+	if request.Label == "" {
+		return nil, status.Error(codes.InvalidArgument, "label name parameter cannot be empty")
+	}
+	if qs.dropLabels.has(request.Label) || containsString(request.WithoutReplicaLabels, request.Label) {
+		return &storepb.LabelValuesResponse{}, nil
+	}
+
+	externalLabels := qs.externalLabels()
+	match, promMatchers, err := matchesExternalLabels(request.Matchers, externalLabels)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	if !match {
+		return &storepb.LabelValuesResponse{}, nil
+	}
+	matches := labelAPISelectorsFromPromMatchers(promMatchers)
+
+	if value := externalLabels.Get(request.Label); value != "" {
+		if len(promMatchers) == 0 {
+			return &storepb.LabelValuesResponse{Values: []string{value}}, nil
+		}
+		labelSets, warnings, err := qs.queryBackendClient.Series(ctx, matches, timeFromMillis(request.Start), timeFromMillis(request.End))
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		if len(labelSets) == 0 {
+			return &storepb.LabelValuesResponse{Warnings: warnings}, nil
+		}
+		return &storepb.LabelValuesResponse{Values: []string{value}, Warnings: warnings}, nil
+	}
+
 	req, warnings, err := qs.queryBackendClient.LabelValues(ctx, request.Label, matches, timeFromMillis(request.Start), timeFromMillis(request.End))
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
@@ -177,7 +242,7 @@ func (qs *queryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryS
 		for _, result := range results {
 			series := &prompb.TimeSeries{
 				Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
-				Labels:  zLabelsFromMetric(result.Metric),
+				Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, qs.externalLabels(), nil),
 			}
 			if err := srv.Send(querypb.NewQueryResponse(series)); err != nil {
 				return err
@@ -214,7 +279,7 @@ func (qs *queryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 		for _, result := range results {
 			series := &prompb.TimeSeries{
 				Samples: samplesFromModel(result.Values),
-				Labels:  zLabelsFromMetric(result.Metric),
+				Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, qs.externalLabels(), nil),
 			}
 			if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
 				return err
@@ -224,7 +289,7 @@ func (qs *queryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 		for _, result := range results {
 			series := &prompb.TimeSeries{
 				Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
-				Labels:  zLabelsFromMetric(result.Metric),
+				Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, qs.externalLabels(), nil),
 			}
 			if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
 				return err
@@ -238,6 +303,7 @@ func (qs *queryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 }
 
 func (qs *queryServer) sendSeriesMetadata(request *storepb.SeriesRequest, server storepb.Store_SeriesServer, selector string, start, end time.Time) error {
+	externalLabels := qs.externalLabels()
 	labelSets, warnings, err := qs.queryBackendClient.Series(server.Context(), []string{selector}, start, end)
 	if err != nil {
 		return status.Error(codes.Aborted, err.Error())
@@ -249,7 +315,7 @@ func (qs *queryServer) sendSeriesMetadata(request *storepb.SeriesRequest, server
 	var sent int64
 	for _, labelSet := range labelSets {
 		if err := server.Send(storepb.NewSeriesResponse(&storepb.Series{
-			Labels: zLabelsFromLabelSet(labelSet),
+			Labels: qs.dropLabels.zLabelsFromLabelSet(labelSet, externalLabels, request.WithoutReplicaLabels),
 		})); err != nil {
 			return err
 		}
@@ -274,21 +340,112 @@ func samplesFromModel(samples []model.SamplePair) []prompb.Sample {
 	return result
 }
 
-// zLabelsFromMetric converts model.Metric to labelpb.Zlabel.
-func zLabelsFromMetric(metric model.Metric) []labelpb.ZLabel {
+type labelDropSet map[string]struct{}
+
+func newLabelDropSet(labels []string) labelDropSet {
+	if len(labels) == 0 {
+		return nil
+	}
+
+	result := make(labelDropSet, len(labels))
+	for _, label := range labels {
+		if label == "" {
+			continue
+		}
+		result[label] = struct{}{}
+	}
+	return result
+}
+
+func (s labelDropSet) has(name string) bool {
+	_, ok := s[name]
+	return ok
+}
+
+func (s labelDropSet) filterNames(names []string) []string {
+	if len(s) == 0 {
+		return names
+	}
+
+	filtered := make([]string, 0, len(names))
+	for _, name := range names {
+		if !s.has(name) {
+			filtered = append(filtered, name)
+		}
+	}
+	return filtered
+}
+
+func (s labelDropSet) labelNames(names []string, externalLabels labels.Labels, withoutLabels []string) []string {
+	remove := s.with(withoutLabels)
+	nameSet := make(map[string]struct{}, len(names)+externalLabels.Len())
+	for _, name := range names {
+		if !remove.has(name) {
+			nameSet[name] = struct{}{}
+		}
+	}
+	if len(names) > 0 {
+		externalLabels.Range(func(label labels.Label) {
+			if !remove.has(label.Name) {
+				nameSet[label.Name] = struct{}{}
+			}
+		})
+	}
+
+	result := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func (s labelDropSet) with(names []string) labelDropSet {
+	if len(names) == 0 {
+		return s
+	}
+	result := make(labelDropSet, len(s)+len(names))
+	for name := range s {
+		result[name] = struct{}{}
+	}
+	for _, name := range names {
+		if name != "" {
+			result[name] = struct{}{}
+		}
+	}
+	return result
+}
+
+// zLabelsFromMetric converts model.Metric to labelpb.ZLabel.
+func (s labelDropSet) zLabelsFromMetric(metric model.Metric, externalLabels labels.Labels, withoutLabels []string) []labelpb.ZLabel {
 	labelSet := make(model.LabelSet, len(metric))
 	for name, value := range metric {
 		labelSet[name] = value
 	}
-	return zLabelsFromLabelSet(labelSet)
+	return s.zLabelsFromLabelSet(labelSet, externalLabels, withoutLabels)
 }
 
-func zLabelsFromLabelSet(labelSet model.LabelSet) []labelpb.ZLabel {
+func (s labelDropSet) zLabelsFromLabelSet(labelSet model.LabelSet, externalLabels labels.Labels, withoutLabels []string) []labelpb.ZLabel {
+	remove := s.with(withoutLabels)
 	values := make(map[string]string, len(labelSet))
 	for name, value := range labelSet {
+		if remove.has(string(name)) {
+			continue
+		}
 		values[string(name)] = string(value)
 	}
-	return labelpb.ZLabelsFromPromLabels(labels.FromMap(values))
+	merged := labelpb.ExtendSortedLabels(labels.FromMap(values), externalLabels)
+	if len(remove) == 0 {
+		return labelpb.ZLabelsFromPromLabels(merged)
+	}
+
+	filtered := make(map[string]string, merged.Len())
+	merged.Range(func(label labels.Label) {
+		if !remove.has(label.Name) {
+			filtered[label.Name] = label.Value
+		}
+	})
+	return labelpb.ZLabelsFromPromLabels(labels.FromMap(filtered))
 }
 
 func labelAPISelectorsFromMatchers(matchers []storepb.LabelMatcher) ([]string, error) {
@@ -302,6 +459,13 @@ func labelAPISelectorsFromMatchers(matchers []storepb.LabelMatcher) ([]string, e
 	return []string{selector}, nil
 }
 
+func labelAPISelectorsFromPromMatchers(matchers []*labels.Matcher) []string {
+	if len(matchers) == 0 {
+		return nil
+	}
+	return []string{querySelectorFromPromMatchers(matchers)}
+}
+
 func querySelectorFromMatchers(matchers []storepb.LabelMatcher) (string, error) {
 	if len(matchers) == 0 {
 		return `{__name__=~".+"}`, nil
@@ -311,6 +475,38 @@ func querySelectorFromMatchers(matchers []storepb.LabelMatcher) (string, error) 
 		return "", err
 	}
 	return storepb.PromMatchersToString(promMatchers...), nil
+}
+
+func querySelectorFromPromMatchers(matchers []*labels.Matcher) string {
+	if len(matchers) == 0 {
+		return `{__name__=~".+"}`
+	}
+	return storepb.PromMatchersToString(matchers...)
+}
+
+// matchesExternalLabels follows Thanos sidecar StoreAPI semantics: external
+// label matchers select this store and are removed before querying the backend.
+func matchesExternalLabels(matchers []storepb.LabelMatcher, externalLabels labels.Labels) (bool, []*labels.Matcher, error) {
+	promMatchers, err := storepb.MatchersToPromMatchers(matchers...)
+	if err != nil {
+		return false, nil, err
+	}
+	if externalLabels.IsEmpty() {
+		return true, promMatchers, nil
+	}
+
+	filtered := make([]*labels.Matcher, 0, len(promMatchers))
+	for _, matcher := range promMatchers {
+		externalValue := externalLabels.Get(matcher.Name)
+		if externalValue == "" {
+			filtered = append(filtered, matcher)
+			continue
+		}
+		if !matcher.Matches(externalValue) {
+			return false, nil, nil
+		}
+	}
+	return true, filtered, nil
 }
 
 func seriesStep(request *storepb.SeriesRequest, fallback time.Duration) time.Duration {
@@ -391,14 +587,75 @@ func sendStoreWarnings(server storepb.Store_SeriesServer, warnings v1.Warnings) 
 	return nil
 }
 
+type externalLabelsStore struct {
+	mtx    sync.RWMutex
+	labels labels.Labels
+}
+
+func newExternalLabelsStore() *externalLabelsStore {
+	return &externalLabelsStore{labels: labels.EmptyLabels()}
+}
+
+func (s *externalLabelsStore) Labels() labels.Labels {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return s.labels.Copy()
+}
+
+func (s *externalLabelsStore) UpdateFromBackend(ctx context.Context, client queryBackendAPI) error {
+	config, err := client.Config(ctx)
+	if err != nil {
+		return err
+	}
+	externalLabels, err := externalLabelsFromConfigYAML(config.YAML)
+	if err != nil {
+		return err
+	}
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	s.labels = externalLabels
+	return nil
+}
+
+func externalLabelsFromConfigYAML(configYAML string) (labels.Labels, error) {
+	var cfg struct {
+		GlobalConfig struct {
+			ExternalLabels map[string]string `yaml:"external_labels"`
+		} `yaml:"global"`
+	}
+	if err := yaml.Unmarshal([]byte(configYAML), &cfg); err != nil {
+		return labels.EmptyLabels(), fmt.Errorf("parse Prometheus config: %w", err)
+	}
+	return labels.FromMap(cfg.GlobalConfig.ExternalLabels), nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 type infoServer struct {
-	queryBackend string
+	queryBackend   string
+	externalLabels func() labels.Labels
 }
 
 func (info *infoServer) Info(ctx context.Context, in *infopb.InfoRequest) (*infopb.InfoResponse, error) {
+	labelSets := labelpb.ZLabelSetsFromPromLabels(labels.FromStrings("query-backend", info.queryBackend))
+	if info.externalLabels != nil {
+		externalLabels := info.externalLabels()
+		if externalLabels.Len() > 0 {
+			labelSets = labelpb.ZLabelSetsFromPromLabels(externalLabels)
+		}
+	}
+
 	return &infopb.InfoResponse{
 		ComponentType: component.Query.String(),
-		LabelSets:     labelpb.ZLabelSetsFromPromLabels(labels.FromStrings("query-backend", info.queryBackend)),
+		LabelSets:     labelSets,
 		Store: &infopb.StoreInfo{
 			MinTime:                      math.MinInt64,
 			MaxTime:                      math.MaxInt64,
@@ -510,6 +767,32 @@ func main() {
 		level.Error(logger).Log("msg", "Error creating client", "err", err)
 		os.Exit(1)
 	}
+	externalLabels := newExternalLabelsStore()
+
+	externalLabelsClient := queryBackendClient
+	if *queryExternalLabelsURL != "" {
+		externalLabelsConfig := *queryConfig
+		externalLabelsConfig.QueryTargetURL = *queryExternalLabelsURL
+		externalLabelsClient, err = createQueryBackendClient(externalLabelsConfig)
+		if err != nil {
+			level.Error(logger).Log("msg", "Error creating external labels client", "err", err)
+			os.Exit(1)
+		}
+	}
+	if *queryExternalLabels {
+		ctx, cancel := context.WithTimeout(context.Background(), *queryExternalLabelsTimeout)
+		err = externalLabels.UpdateFromBackend(ctx, externalLabelsClient)
+		cancel()
+		if err != nil {
+			level.Error(logger).Log("msg", "Error loading initial external labels", "err", err)
+			os.Exit(1)
+		}
+		if externalLabels.Labels().Len() == 0 {
+			level.Error(logger).Log("msg", "no external labels configured on backend")
+			os.Exit(1)
+		}
+		level.Info(logger).Log("msg", "successfully loaded backend external labels", "external_labels", externalLabels.Labels().String())
+	}
 
 	var g run.Group
 	{
@@ -531,6 +814,30 @@ func main() {
 			},
 		)
 	}
+	if *queryExternalLabels {
+		ctx, cancel := context.WithCancel(context.Background())
+		g.Add(func() error {
+			ticker := time.NewTicker(*queryExternalLabelsInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					iterCtx, iterCancel := context.WithTimeout(context.Background(), *queryExternalLabelsTimeout)
+					err := externalLabels.UpdateFromBackend(iterCtx, externalLabelsClient)
+					iterCancel()
+					if err != nil {
+						level.Warn(logger).Log("msg", "updating external labels failed", "err", err)
+						continue
+					}
+					level.Info(logger).Log("msg", "updated backend external labels", "external_labels", externalLabels.Labels().String())
+				case <-ctx.Done():
+					return nil
+				}
+			}
+		}, func(err error) {
+			cancel()
+		})
+	}
 	{
 		//grpc server.
 		listener, err := net.Listen("tcp", *connectorAddress)
@@ -538,9 +845,10 @@ func main() {
 			panic(err)
 		}
 		server := grpc.NewServer()
-		storepb.RegisterStoreServer(server, &queryServer{queryBackendClient: queryBackendClient})
-		querypb.RegisterQueryServer(server, &queryServer{queryBackendClient: queryBackendClient})
-		infopb.RegisterInfoServer(server, &infoServer{queryBackend: queryConfig.QueryTargetURL})
+		queryServer := newQueryServer(queryBackendClient, queryDropLabels.values(), externalLabels.Labels)
+		storepb.RegisterStoreServer(server, queryServer)
+		querypb.RegisterQueryServer(server, queryServer)
+		infopb.RegisterInfoServer(server, &infoServer{queryBackend: queryConfig.QueryTargetURL, externalLabels: externalLabels.Labels})
 		g.Add(func() error {
 			level.Info(logger).Log("msg", "Starting grpc server for query endpoint", "listen", *connectorAddress)
 			return server.Serve(listener)

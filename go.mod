@@ -14,6 +14,7 @@ require (
 	github.com/thanos-io/thanos v0.37.1
 	google.golang.org/api v0.195.0
 	google.golang.org/grpc v1.66.0
+	gopkg.in/yaml.v2 v2.4.0
 )
 
 require (
@@ -39,6 +40,7 @@ require (
 	github.com/grafana/regexp v0.0.0-20240518133315-a468a5bfb3bc // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
+	github.com/kr/text v0.2.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
