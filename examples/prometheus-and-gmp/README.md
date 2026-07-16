@@ -11,7 +11,7 @@ This example demonstrates how to connect Thanos Querier to two Prometheus instan
 
 ## Run Instructions:
 1. <b>Edit</b> docker-compose.yml:
-    - Insert your `<PROJECT_ID>` in the config.yaml
+    - Replace `<PROJECT_ID>` in the `querier-3` `--query.target-url` value.
     - Add your service account JSON key file to this folder and name it `key.json`.
 2. <b>Start the services:</b> Run the following command:
     ```bash
