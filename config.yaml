@@ -1,6 +1,0 @@
-query_target_url: http://127.0.0.1:18080/prometheus # Mimir Querier
-headers:
-    X-Scope-OrgID: tenant1|tenant2
-# auth: 
-#   credentials_file: 
-#   scopes: 
