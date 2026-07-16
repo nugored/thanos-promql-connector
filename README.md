@@ -51,6 +51,44 @@ the request into a PromQL HTTP `query_range` call and encodes returned samples a
 Thanos XOR chunks. If Thanos does not send a step hint, the connector uses
 `--query.series-step`, which defaults to `1m`.
 
+## gRPC TLS
+
+The connector can serve the Thanos QueryAPI, StoreAPI, and Info gRPC services
+over TLS:
+
+```bash
+--grpc-server-tls-cert=/tls/tls.crt
+--grpc-server-tls-key=/tls/tls.key
+```
+
+For strict mTLS, also configure a client CA. When this flag is set, the
+connector requires and verifies the client certificate presented by Thanos
+Querier:
+
+```bash
+--grpc-server-tls-client-ca=/tls/ca.crt
+```
+
+With one-way TLS and your Querier-side settings, Thanos Querier can connect with:
+
+```bash
+--endpoint=thanos-promql-connector:8081
+--grpc-client-tls-secure
+--grpc-client-tls-skip-verify
+--grpc-client-tls-cert=/tls/tls.crt
+--grpc-client-tls-key=/tls/tls.key
+```
+
+The connector only validates the Querier client certificate when
+`--grpc-server-tls-client-ca` is configured.
+
+The connector also registers Thanos' `snappy` gRPC compressor, so it can accept
+metadata and query calls from Querier when Querier is started with:
+
+```bash
+--grpc-compression=snappy
+```
+
 ## Response Label Dropping
 
 Labels can be removed from QueryAPI and StoreAPI responses with `--query.drop-label`.

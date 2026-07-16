@@ -2,7 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -11,6 +19,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"google.golang.org/grpc/encoding"
 )
 
 func TestNewQueryBackendRoundTripperSkipsGoogleAuthWhenAuthEmpty(t *testing.T) {
@@ -37,6 +46,74 @@ func TestNewQueryBackendRoundTripperKeepsHeadersWithoutAuth(t *testing.T) {
 	}
 	if headerRT.base != http.DefaultTransport {
 		t.Fatalf("header round tripper base = %T, want http.DefaultTransport", headerRT.base)
+	}
+}
+
+func TestNewGRPCServerOptionsSkipsTLSWhenEmpty(t *testing.T) {
+	options, enabled, err := newGRPCServerOptions(grpcServerTLSConfig{})
+	if err != nil {
+		t.Fatalf("newGRPCServerOptions() returned error: %v", err)
+	}
+	if enabled {
+		t.Fatal("newGRPCServerOptions() enabled TLS, want disabled")
+	}
+	if len(options) != 0 {
+		t.Fatalf("len(options) = %d, want 0", len(options))
+	}
+}
+
+func TestSnappyGRPCCompressorRegistered(t *testing.T) {
+	if encoding.GetCompressor("snappy") == nil {
+		t.Fatal("snappy gRPC compressor is not registered")
+	}
+}
+
+func TestNewGRPCServerOptionsRequiresCertAndKey(t *testing.T) {
+	if _, _, err := newGRPCServerOptions(grpcServerTLSConfig{CertFile: "/tls/tls.crt"}); err == nil {
+		t.Fatal("newGRPCServerOptions() succeeded with cert only, want error")
+	}
+	if _, _, err := newGRPCServerOptions(grpcServerTLSConfig{KeyFile: "/tls/tls.key"}); err == nil {
+		t.Fatal("newGRPCServerOptions() succeeded with key only, want error")
+	}
+	if _, _, err := newGRPCServerOptions(grpcServerTLSConfig{ClientCAFile: "/tls/ca.crt"}); err == nil {
+		t.Fatal("newGRPCServerOptions() succeeded with client CA only, want error")
+	}
+}
+
+func TestNewGRPCServerOptionsLoadsTLSCertificate(t *testing.T) {
+	certFile, keyFile := writeTestCertificate(t)
+
+	options, enabled, err := newGRPCServerOptions(grpcServerTLSConfig{
+		CertFile: certFile,
+		KeyFile:  keyFile,
+	})
+	if err != nil {
+		t.Fatalf("newGRPCServerOptions() returned error: %v", err)
+	}
+	if !enabled {
+		t.Fatal("newGRPCServerOptions() disabled TLS, want enabled")
+	}
+	if len(options) != 1 {
+		t.Fatalf("len(options) = %d, want 1", len(options))
+	}
+}
+
+func TestNewGRPCServerOptionsLoadsClientCA(t *testing.T) {
+	certFile, keyFile := writeTestCertificate(t)
+
+	options, enabled, err := newGRPCServerOptions(grpcServerTLSConfig{
+		CertFile:     certFile,
+		KeyFile:      keyFile,
+		ClientCAFile: certFile,
+	})
+	if err != nil {
+		t.Fatalf("newGRPCServerOptions() returned error: %v", err)
+	}
+	if !enabled {
+		t.Fatal("newGRPCServerOptions() disabled TLS, want enabled")
+	}
+	if len(options) != 1 {
+		t.Fatalf("len(options) = %d, want 1", len(options))
 	}
 }
 
@@ -399,4 +476,44 @@ func TestExternalLabelsOverrideResultLabels(t *testing.T) {
 	if !reflect.DeepEqual(labelMap, want) {
 		t.Fatalf("zLabelsFromMetric() = %v, want %v", labelMap, want)
 	}
+}
+
+func writeTestCertificate(t *testing.T) (string, string) {
+	t.Helper()
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("GenerateKey() returned error: %v", err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"localhost"},
+	}
+	certificateDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatalf("CreateCertificate() returned error: %v", err)
+	}
+
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "tls.crt")
+	keyFile := filepath.Join(dir, "tls.key")
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
+	if err := os.WriteFile(certFile, certPEM, 0600); err != nil {
+		t.Fatalf("WriteFile(%q) returned error: %v", certFile, err)
+	}
+
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	if err := os.WriteFile(keyFile, keyPEM, 0600); err != nil {
+		t.Fatalf("WriteFile(%q) returned error: %v", keyFile, err)
+	}
+
+	return certFile, keyFile
 }

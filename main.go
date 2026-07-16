@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,6 +29,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/thanos/pkg/api/query/querypb"
 	"github.com/thanos-io/thanos/pkg/component"
+	_ "github.com/thanos-io/thanos/pkg/extgrpc/snappy"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -35,6 +38,7 @@ import (
 	apihttp "google.golang.org/api/transport/http"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"gopkg.in/yaml.v2"
 )
 
@@ -59,6 +63,12 @@ var (
 	querySeriesStep  = flag.Duration("query.series-step", time.Minute, "Fallback step for StoreAPI series queries when Thanos does not send a query step hint.")
 	connectorAddress = flag.String("connector-address", ":8081",
 		"Address on which to expose the query grpc server.")
+	grpcServerTLSCertFile = flag.String("grpc-server-tls-cert", "",
+		"TLS certificate file for the gRPC server. Requires grpc-server-tls-key when set.")
+	grpcServerTLSKeyFile = flag.String("grpc-server-tls-key", "",
+		"TLS private key file for the gRPC server. Requires grpc-server-tls-cert when set.")
+	grpcServerTLSClientCAFile = flag.String("grpc-server-tls-client-ca", "",
+		"Client CA certificate file for mTLS on the gRPC server. When set, client certificates are required and verified.")
 	metricsAddress = flag.String("metrics-address", ":9090",
 		"Address on which to expose metrics")
 )
@@ -859,6 +869,47 @@ func createQueryBackendClient(queryConfig queryBackendConfig) (queryBackendAPI, 
 	return v1.NewAPI(client), nil
 }
 
+type grpcServerTLSConfig struct {
+	CertFile     string
+	KeyFile      string
+	ClientCAFile string
+}
+
+func newGRPCServerOptions(tlsConfig grpcServerTLSConfig) ([]grpc.ServerOption, bool, error) {
+	tlsEnabled := tlsConfig.CertFile != "" || tlsConfig.KeyFile != "" || tlsConfig.ClientCAFile != ""
+	if !tlsEnabled {
+		return nil, false, nil
+	}
+	if tlsConfig.CertFile == "" || tlsConfig.KeyFile == "" {
+		return nil, false, fmt.Errorf("grpc-server-tls-cert and grpc-server-tls-key must both be set to enable gRPC TLS")
+	}
+
+	cert, err := tls.LoadX509KeyPair(tlsConfig.CertFile, tlsConfig.KeyFile)
+	if err != nil {
+		return nil, false, fmt.Errorf("load gRPC server certificate: %w", err)
+	}
+
+	serverTLSConfig := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"h2"},
+		Certificates: []tls.Certificate{cert},
+	}
+	if tlsConfig.ClientCAFile != "" {
+		clientCAPEM, err := os.ReadFile(tlsConfig.ClientCAFile)
+		if err != nil {
+			return nil, false, fmt.Errorf("read gRPC client CA file: %w", err)
+		}
+		clientCAs := x509.NewCertPool()
+		if !clientCAs.AppendCertsFromPEM(clientCAPEM) {
+			return nil, false, fmt.Errorf("parse gRPC client CA file %q: no certificates found", tlsConfig.ClientCAFile)
+		}
+		serverTLSConfig.ClientCAs = clientCAs
+		serverTLSConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	return []grpc.ServerOption{grpc.Creds(credentials.NewTLS(serverTLSConfig))}, true, nil
+}
+
 func main() {
 	flag.Parse()
 	logger := log.NewJSONLogger(log.NewSyncWriter(os.Stderr))
@@ -1004,7 +1055,16 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		server := grpc.NewServer()
+		serverOptions, tlsEnabled, err := newGRPCServerOptions(grpcServerTLSConfig{
+			CertFile:     *grpcServerTLSCertFile,
+			KeyFile:      *grpcServerTLSKeyFile,
+			ClientCAFile: *grpcServerTLSClientCAFile,
+		})
+		if err != nil {
+			level.Error(logger).Log("msg", "Error creating grpc server TLS config", "err", err)
+			os.Exit(1)
+		}
+		server := grpc.NewServer(serverOptions...)
 		queryServer := newQueryServer(queryBackendClient, queryDropLabels.values(), externalLabels.Labels)
 		storepb.RegisterStoreServer(server, queryServer)
 		querypb.RegisterQueryServer(server, queryServer)
@@ -1014,7 +1074,7 @@ func main() {
 			announcedLabelSets: announcedLabelSets.LabelSets,
 		})
 		g.Add(func() error {
-			level.Info(logger).Log("msg", "Starting grpc server for query endpoint", "listen", *connectorAddress)
+			level.Info(logger).Log("msg", "Starting grpc server for query endpoint", "listen", *connectorAddress, "tls", tlsEnabled, "mtls", *grpcServerTLSClientCAFile != "")
 			return server.Serve(listener)
 		}, func(err error) {
 			server.GracefulStop()
