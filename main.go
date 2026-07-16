@@ -39,10 +39,11 @@ import (
 )
 
 var (
-	queryTargetURL  = flag.String("query.target-url", "", "PromQL HTTP API backend URL.")
-	queryHeaders    headerFlags
-	queryAuthScopes stringListFlag
-	queryDropLabels stringListFlag
+	queryTargetURL      = flag.String("query.target-url", "", "PromQL HTTP API backend URL.")
+	queryHeaders        headerFlags
+	queryAuthScopes     stringListFlag
+	queryDropLabels     stringListFlag
+	queryAnnounceLabels stringListFlag
 
 	queryAuthCredentialsFile    = flag.String("query.auth.credentials-file", "", "Google auth credentials file for backend requests.")
 	queryExternalLabels         = flag.Bool("query.external-labels", false, "Read and apply global.external_labels from the backend /api/v1/status/config endpoint, matching Thanos sidecar behavior.")
@@ -51,6 +52,10 @@ var (
 		"How often to refresh external labels when query.external-labels is enabled.")
 	queryExternalLabelsTimeout = flag.Duration("query.external-labels.timeout", 5*time.Second,
 		"Timeout for each external labels fetch when query.external-labels is enabled.")
+	queryAnnounceLabelRefresh = flag.Duration("query.announce-label-refresh", time.Minute,
+		"How often to refresh StoreAPI Info label sets from backend label values when query.announce-label is set.")
+	queryAnnounceLabelTimeout = flag.Duration("query.announce-label-timeout", 5*time.Second,
+		"Timeout for each announced label values fetch when query.announce-label is set.")
 	querySeriesStep  = flag.Duration("query.series-step", time.Minute, "Fallback step for StoreAPI series queries when Thanos does not send a query step hint.")
 	connectorAddress = flag.String("connector-address", ":8081",
 		"Address on which to expose the query grpc server.")
@@ -62,6 +67,7 @@ func init() {
 	flag.Var(&queryHeaders, "query.header", "Static header to add to backend requests, in Name=Value or Name: Value format. May be repeated.")
 	flag.Var(&queryAuthScopes, "query.auth.scope", "Google auth OAuth scope for backend requests. May be repeated or comma-separated.")
 	flag.Var(&queryDropLabels, "query.drop-label", "Label to remove from query and StoreAPI responses. May be repeated or comma-separated.")
+	flag.Var(&queryAnnounceLabels, "query.announce-label", "Backend label whose values should be advertised as StoreAPI Info label sets. May be repeated or comma-separated.")
 }
 
 type queryBackendAPI interface {
@@ -618,6 +624,90 @@ func (s *externalLabelsStore) UpdateFromBackend(ctx context.Context, client quer
 	return nil
 }
 
+type announcedLabelSetsStore struct {
+	mtx       sync.RWMutex
+	labelSets []labels.Labels
+}
+
+func newAnnouncedLabelSetsStore() *announcedLabelSetsStore {
+	return &announcedLabelSetsStore{}
+}
+
+func (s *announcedLabelSetsStore) LabelSets() []labels.Labels {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	result := make([]labels.Labels, 0, len(s.labelSets))
+	for _, labelSet := range s.labelSets {
+		result = append(result, labelSet.Copy())
+	}
+	return result
+}
+
+func (s *announcedLabelSetsStore) UpdateFromBackend(ctx context.Context, client queryBackendAPI, labelNames []string) error {
+	labelSets, err := announcedLabelSetsFromBackend(ctx, client, labelNames)
+	if err != nil {
+		return err
+	}
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	s.labelSets = labelSets
+	return nil
+}
+
+func announcedLabelSetsFromBackend(ctx context.Context, client queryBackendAPI, labelNames []string) ([]labels.Labels, error) {
+	labelSets := make([]labels.Labels, 0)
+	seen := make(map[string]struct{})
+
+	for _, labelName := range labelNames {
+		if !model.LabelName(labelName).IsValid() {
+			return nil, fmt.Errorf("invalid announced label name %q", labelName)
+		}
+
+		values, _, err := client.LabelValues(ctx, labelName, nil, time.Time{}, time.Time{})
+		if err != nil {
+			return nil, fmt.Errorf("read values for announced label %q: %w", labelName, err)
+		}
+		for _, labelSet := range announcedLabelSetsFromValues(labelName, values) {
+			key := labelSet.String()
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			labelSets = append(labelSets, labelSet)
+		}
+	}
+
+	sort.Slice(labelSets, func(i, j int) bool {
+		return labelSets[i].String() < labelSets[j].String()
+	})
+	return labelSets, nil
+}
+
+func announcedLabelSetsFromValues(labelName string, values model.LabelValues) []labels.Labels {
+	uniqueValues := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value := string(value)
+		if value == "" {
+			continue
+		}
+		uniqueValues[value] = struct{}{}
+	}
+
+	sortedValues := make([]string, 0, len(uniqueValues))
+	for value := range uniqueValues {
+		sortedValues = append(sortedValues, value)
+	}
+	sort.Strings(sortedValues)
+
+	labelSets := make([]labels.Labels, 0, len(sortedValues))
+	for _, value := range sortedValues {
+		labelSets = append(labelSets, labels.FromStrings(labelName, value))
+	}
+	return labelSets
+}
+
 func externalLabelsFromConfigYAML(configYAML string) (labels.Labels, error) {
 	var cfg struct {
 		GlobalConfig struct {
@@ -640,16 +730,30 @@ func containsString(values []string, target string) bool {
 }
 
 type infoServer struct {
-	queryBackend   string
-	externalLabels func() labels.Labels
+	queryBackend       string
+	externalLabels     func() labels.Labels
+	announcedLabelSets func() []labels.Labels
 }
 
 func (info *infoServer) Info(ctx context.Context, in *infopb.InfoRequest) (*infopb.InfoResponse, error) {
 	labelSets := labelpb.ZLabelSetsFromPromLabels(labels.FromStrings("query-backend", info.queryBackend))
-	if info.externalLabels != nil {
+	tsdbInfos := []infopb.TSDBInfo{{MinTime: math.MinInt64, MaxTime: math.MaxInt64}}
+	usingFallbackLabelSet := true
+
+	if info.announcedLabelSets != nil {
+		announcedLabelSets := info.announcedLabelSets()
+		if len(announcedLabelSets) > 0 {
+			labelSets = labelpb.ZLabelSetsFromPromLabels(announcedLabelSets...)
+			tsdbInfos = tsdbInfosFromLabelSets(labelSets)
+			usingFallbackLabelSet = false
+		}
+	}
+
+	if usingFallbackLabelSet && info.externalLabels != nil {
 		externalLabels := info.externalLabels()
 		if externalLabels.Len() > 0 {
 			labelSets = labelpb.ZLabelSetsFromPromLabels(externalLabels)
+			tsdbInfos = tsdbInfosFromLabelSets(labelSets)
 		}
 	}
 
@@ -660,15 +764,22 @@ func (info *infoServer) Info(ctx context.Context, in *infopb.InfoRequest) (*info
 			MinTime:                      math.MinInt64,
 			MaxTime:                      math.MaxInt64,
 			SupportsWithoutReplicaLabels: true,
-			TsdbInfos: []infopb.TSDBInfo{
-				{
-					MinTime: math.MinInt64,
-					MaxTime: math.MaxInt64,
-				},
-			},
+			TsdbInfos:                    tsdbInfos,
 		},
 		Query: &infopb.QueryAPIInfo{},
 	}, nil
+}
+
+func tsdbInfosFromLabelSets(labelSets []labelpb.ZLabelSet) []infopb.TSDBInfo {
+	result := make([]infopb.TSDBInfo, 0, len(labelSets))
+	for _, labelSet := range labelSets {
+		result = append(result, infopb.TSDBInfo{
+			Labels:  labelSet,
+			MinTime: math.MinInt64,
+			MaxTime: math.MaxInt64,
+		})
+	}
+	return result
 }
 
 type headerRoundTripper struct {
@@ -768,6 +879,8 @@ func main() {
 		os.Exit(1)
 	}
 	externalLabels := newExternalLabelsStore()
+	announcedLabelSets := newAnnouncedLabelSetsStore()
+	announcedLabelNames := queryAnnounceLabels.values()
 
 	externalLabelsClient := queryBackendClient
 	if *queryExternalLabelsURL != "" {
@@ -792,6 +905,29 @@ func main() {
 			os.Exit(1)
 		}
 		level.Info(logger).Log("msg", "successfully loaded backend external labels", "external_labels", externalLabels.Labels().String())
+	}
+	if len(announcedLabelNames) > 0 {
+		if *queryAnnounceLabelRefresh <= 0 {
+			level.Error(logger).Log("msg", "query.announce-label-refresh must be greater than zero")
+			os.Exit(1)
+		}
+		if *queryAnnounceLabelTimeout <= 0 {
+			level.Error(logger).Log("msg", "query.announce-label-timeout must be greater than zero")
+			os.Exit(1)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), *queryAnnounceLabelTimeout)
+		err = announcedLabelSets.UpdateFromBackend(ctx, queryBackendClient, announcedLabelNames)
+		cancel()
+		if err != nil {
+			level.Error(logger).Log("msg", "Error loading initial announced label sets", "err", err)
+			os.Exit(1)
+		}
+		if len(announcedLabelSets.LabelSets()) == 0 {
+			level.Error(logger).Log("msg", "no announced label values found on backend", "labels", fmt.Sprint(announcedLabelNames))
+			os.Exit(1)
+		}
+		level.Info(logger).Log("msg", "successfully loaded backend announced label sets", "labels", fmt.Sprint(announcedLabelNames), "label_sets", fmt.Sprint(announcedLabelSets.LabelSets()))
 	}
 
 	var g run.Group
@@ -838,6 +974,30 @@ func main() {
 			cancel()
 		})
 	}
+	if len(announcedLabelNames) > 0 {
+		ctx, cancel := context.WithCancel(context.Background())
+		g.Add(func() error {
+			ticker := time.NewTicker(*queryAnnounceLabelRefresh)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					iterCtx, iterCancel := context.WithTimeout(context.Background(), *queryAnnounceLabelTimeout)
+					err := announcedLabelSets.UpdateFromBackend(iterCtx, queryBackendClient, announcedLabelNames)
+					iterCancel()
+					if err != nil {
+						level.Warn(logger).Log("msg", "updating announced label sets failed", "err", err)
+						continue
+					}
+					level.Info(logger).Log("msg", "updated backend announced label sets", "labels", fmt.Sprint(announcedLabelNames), "label_sets", fmt.Sprint(announcedLabelSets.LabelSets()))
+				case <-ctx.Done():
+					return nil
+				}
+			}
+		}, func(err error) {
+			cancel()
+		})
+	}
 	{
 		//grpc server.
 		listener, err := net.Listen("tcp", *connectorAddress)
@@ -848,7 +1008,11 @@ func main() {
 		queryServer := newQueryServer(queryBackendClient, queryDropLabels.values(), externalLabels.Labels)
 		storepb.RegisterStoreServer(server, queryServer)
 		querypb.RegisterQueryServer(server, queryServer)
-		infopb.RegisterInfoServer(server, &infoServer{queryBackend: queryConfig.QueryTargetURL, externalLabels: externalLabels.Labels})
+		infopb.RegisterInfoServer(server, &infoServer{
+			queryBackend:       queryConfig.QueryTargetURL,
+			externalLabels:     externalLabels.Labels,
+			announcedLabelSets: announcedLabelSets.LabelSets,
+		})
 		g.Add(func() error {
 			level.Info(logger).Log("msg", "Starting grpc server for query endpoint", "listen", *connectorAddress)
 			return server.Serve(listener)

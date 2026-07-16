@@ -61,6 +61,32 @@ tenant-disambiguating label, for example an external label named `prometheus`:
 --query.drop-label=__tenant_id__
 ```
 
+## Announced LabelSets From Backend Labels
+
+For a federated Mimir backend that already stores a per-series external label
+such as `prometheus`, the connector can advertise the backend values of that
+label in StoreAPI `Info`:
+
+```bash
+--query.announce-label=prometheus
+--query.announce-label-refresh=1m
+```
+
+With a Mimir target URL such as `http://mimir-querier:8080/prometheus`, this
+uses the Prometheus-compatible label values endpoint:
+
+```text
+/prometheus/api/v1/label/prometheus/values
+```
+
+The connector sends the same static headers configured with `--query.header`, so
+tenant federation headers such as `X-Scope-OrgID` are included in this request.
+
+This changes only the label sets shown by Thanos Querier for this endpoint. The
+announced label remains a normal series label, and StoreAPI matchers for it are
+still forwarded to the backend. This is the recommended mode for Mimir tenant
+federation together with `--query.drop-label=__tenant_id__`.
+
 ## Backend External Labels
 
 The connector can read `global.external_labels` from a Prometheus-compatible
@@ -99,6 +125,7 @@ connector to advertise.
   with Mimir containing metrics from several Prometheuses, each already ingested with external label prometheus, the correct mechanism is:
 
   --query.drop-label=__tenant_id__
+  --query.announce-label=prometheus
 
   and do not enable:
 
@@ -108,12 +135,16 @@ connector to advertise.
   Prometheus sources, so there is no single external label set the connector should advertise. If the connector advertised one prometheus=... label globally, Thanos would incorrectly treat the whole Mimir-
   backed endpoint as only that one source.
 
+  The announce-label mechanism is different: it reads backend values for the prometheus label and advertises each value as an Info label set, without stripping prometheus matchers or overriding returned series labels.
+
   Your existing Mimir data already has prometheus on each series. The connector should preserve that per-series label and only drop Mimir’s federation label:
 
   args:
     - --query.target-url=http://mimir-querier:8080/prometheus
     - '--query.header=X-Scope-OrgID=grazie|jetbrains-ai|k8s|tempo-grazie|tempo-k8s|fus'
     - --query.drop-label=__tenant_id__
+    - --query.announce-label=prometheus
+    - --query.announce-label-refresh=1m
 
   That should work as long as prometheus uniquely distinguishes the original Prometheus sources.
 
@@ -121,7 +152,7 @@ connector to advertise.
 › Is it right that now thanos-promql-connector parses external labels from Mimir and responds with this external labels to grpc requests from Thanos Queriers?
 
 
-• No, not with the current deployment.yaml.
+• No: it does not parse external labels from Mimir unless you enable the sidecar-style external-label mode.
 
   The connector only parses and advertises backend external labels if you explicitly start it with:
 
@@ -132,8 +163,10 @@ connector to advertise.
   - --query.target-url=http://mimir-querier:8080/prometheus
   - '--query.header=X-Scope-OrgID=grazie|jetbrains-ai|k8s|tempo-grazie|tempo-k8s|fus'
   - --query.drop-label=__tenant_id__
+  - --query.announce-label=prometheus
+  - --query.announce-label-refresh=1m
 
-  So right now it does not parse external labels from Mimir and does not advertise Mimir-derived external labels in StoreAPI Info.
+  So it does not parse Mimir external labels from /api/v1/status/config. It reads backend values for the prometheus label and advertises those values in StoreAPI Info.
 
   It only:
 
@@ -141,6 +174,7 @@ connector to advertise.
   2. Receives series labels from Mimir.
   3. Drops __tenant_id__.
   4. Keeps your existing per-series prometheus label.
+  5. Advertises backend prometheus values as Info label sets.
 
   That is the behavior you want for Mimir federation. Do not enable --query.external-labels for this multi-Prometheus Mimir backend.
 
@@ -171,10 +205,9 @@ connector to advertise.
 
   Thanos Querier -> connector -> Mimir Querier with many Prometheuses / tenants
 
-  because Mimir represents many sources, not one external label set. For that case, use only:
+  because Mimir represents many sources, not one external label set. For that case, use:
 
   --query.drop-label=__tenant_id__
+  --query.announce-label=prometheus
 
-  and rely on the existing per-series prometheus label already stored in Mimir.
-
-
+  and rely on the existing per-series prometheus label already stored in Mimir for query results and matcher routing.
