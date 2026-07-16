@@ -65,7 +65,7 @@ func GRPCCodeFromWarn(warn string) codes.Code {
 type emptySeriesSet struct{}
 
 func (emptySeriesSet) Next() bool                       { return false }
-func (emptySeriesSet) At() (labels.Labels, []AggrChunk) { return nil, nil }
+func (emptySeriesSet) At() (labels.Labels, []AggrChunk) { return labels.EmptyLabels(), nil }
 func (emptySeriesSet) Err() error                       { return nil }
 
 // EmptySeriesSet returns a new series set that contains no series.
@@ -329,7 +329,10 @@ func (m *Chunk) Compare(b *Chunk) int {
 func (x *PartialResponseStrategy) UnmarshalJSON(entry []byte) error {
 	fieldStr, err := strconv.Unquote(string(entry))
 	if err != nil {
-		return errors.Wrapf(err, fmt.Sprintf("failed to unqote %v, in order to unmarshal as 'partial_response_strategy'. Possible values are %s", string(entry), strings.Join(PartialResponseStrategyValues, ",")))
+		return errors.Wrapf(
+			err,
+			"failed to unqote %v, in order to unmarshal as 'partial_response_strategy'. Possible values are %s", string(entry), strings.Join(PartialResponseStrategyValues, ","),
+		)
 	}
 
 	if fieldStr == "" {
@@ -340,7 +343,11 @@ func (x *PartialResponseStrategy) UnmarshalJSON(entry []byte) error {
 
 	strategy, ok := PartialResponseStrategy_value[strings.ToUpper(fieldStr)]
 	if !ok {
-		return errors.Errorf(fmt.Sprintf("failed to unmarshal %v as 'partial_response_strategy'. Possible values are %s", string(entry), strings.Join(PartialResponseStrategyValues, ",")))
+		return errors.Errorf(
+			"failed to unmarshal %v as 'partial_response_strategy'. Possible values are %s",
+			string(entry),
+			strings.Join(PartialResponseStrategyValues, ","),
+		)
 	}
 	*x = PartialResponseStrategy(strategy)
 	return nil
@@ -531,24 +538,4 @@ func (c *SeriesStatsCounter) Count(series *Series) {
 
 func (m *SeriesRequest) ToPromQL() string {
 	return m.QueryHints.toPromQL(m.Matchers)
-}
-
-// IsSafeToExecute returns true if the function or aggregation from the query hint
-// can be safely executed by the underlying Prometheus instance without affecting the
-// result of the query.
-func (m *QueryHints) IsSafeToExecute() bool {
-	distributiveOperations := []string{
-		"max",
-		"max_over_time",
-		"min",
-		"min_over_time",
-		"group",
-	}
-	for _, op := range distributiveOperations {
-		if m.Func.Name == op {
-			return true
-		}
-	}
-
-	return false
 }

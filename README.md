@@ -23,3 +23,13 @@ go run ./cmd/thanos query --endpoint :8081 --query.mode distributed --query.prom
 ```
 
 4. View Thanos Querier UI at address [0.0.0.0:10902](http://localhost:10902/).
+
+## Backend Request Headers
+
+Static headers can be added to every proxied PromQL backend request with the `headers` field:
+
+```yaml
+query_target_url: http://127.0.0.1:18080/prometheus
+headers:
+  X-Scope-OrgID: tenant1|tenant2 # this set to let everyone query
+```

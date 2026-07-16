@@ -3,13 +3,15 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v2"
 )
 
 // queryBackendConfig represents the configuration for a backend query target.
 type queryBackendConfig struct {
-	QueryTargetURL string `yaml:"query_target_url"`
+	QueryTargetURL string            `yaml:"query_target_url"`
+	Headers        map[string]string `yaml:"headers"`
 	Auth           struct {
 		CredentialsFile string   `yaml:"credentials_file"`
 		Scopes          []string `yaml:"scopes"`
@@ -33,6 +35,11 @@ func loadQueryConfig(fileName string) (*queryBackendConfig, error) {
 
 	if cfg.QueryTargetURL == "" {
 		return nil, fmt.Errorf("query_target_url needs to be set")
+	}
+	for name := range cfg.Headers {
+		if strings.TrimSpace(name) == "" {
+			return nil, fmt.Errorf("headers cannot contain an empty header name")
+		}
 	}
 	return cfg, nil
 }

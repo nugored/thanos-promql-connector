@@ -212,6 +212,41 @@ func (info *infoServer) Info(ctx context.Context, in *infopb.InfoRequest) (*info
 	}, nil
 }
 
+type headerRoundTripper struct {
+	base    http.RoundTripper
+	headers http.Header
+}
+
+func newHeaderRoundTripper(base http.RoundTripper, headers map[string]string) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if len(headers) == 0 {
+		return base
+	}
+
+	rt := &headerRoundTripper{
+		base:    base,
+		headers: make(http.Header, len(headers)),
+	}
+	for name, value := range headers {
+		rt.headers.Set(name, value)
+	}
+	return rt
+}
+
+func (rt *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	outgoing := req.Clone(req.Context())
+	for name, values := range rt.headers {
+		outgoing.Header.Del(name)
+		for _, value := range values {
+			outgoing.Header.Add(name, value)
+		}
+	}
+
+	return rt.base.RoundTrip(outgoing)
+}
+
 // createQueryBackendClient creates a connection with the backend that the queries will be forwarded to.
 func createQueryBackendClient(queryConfig queryBackendConfig) (v1.API, error) {
 	opts := []option.ClientOption{
@@ -222,6 +257,7 @@ func createQueryBackendClient(queryConfig queryBackendConfig) (v1.API, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error creating proxy HTTP transport: %s", err)
 	}
+	transport = newHeaderRoundTripper(transport, queryConfig.Headers)
 	client, err := api.NewClient(api.Config{
 		Address:      queryConfig.QueryTargetURL,
 		RoundTripper: transport,
