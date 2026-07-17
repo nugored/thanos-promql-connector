@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -60,6 +61,8 @@ var (
 		"How often to refresh StoreAPI Info label sets from backend label values when query.announce-label is set.")
 	queryAnnounceLabelTimeout = flag.Duration("query.announce-label-timeout", 5*time.Second,
 		"Timeout for each announced label values fetch when query.announce-label is set.")
+	queryAnnounceLabelLookback = flag.Duration("query.announce-label-lookback", 0,
+		"Only read announced label values from this recent time range. Set 0 to read without start/end bounds.")
 	querySeriesStep = flag.Duration("query.series-step", time.Minute,
 		"Fallback step for StoreAPI series queries when Thanos does not send a query step hint.")
 	queryMaxPointsPerSeries = flag.Int("query.max-points-per-series", 11000,
@@ -671,6 +674,21 @@ type announcedLabelSetsStore struct {
 	labelSets []labels.Labels
 }
 
+type announcedLabelSource struct {
+	name   string
+	client queryBackendAPI
+}
+
+type announcedLabelSourceConfig struct {
+	name   string
+	config queryBackendConfig
+}
+
+type announcedLabelSourceFailure struct {
+	source string
+	err    error
+}
+
 func newAnnouncedLabelSetsStore() *announcedLabelSetsStore {
 	return &announcedLabelSetsStore{}
 }
@@ -687,18 +705,75 @@ func (s *announcedLabelSetsStore) LabelSets() []labels.Labels {
 }
 
 func (s *announcedLabelSetsStore) UpdateFromBackend(ctx context.Context, client queryBackendAPI, labelNames []string) error {
-	labelSets, err := announcedLabelSetsFromBackend(ctx, client, labelNames)
-	if err != nil {
-		return err
+	_, err := s.UpdateFromSources(ctx, []announcedLabelSource{{name: "backend", client: client}}, labelNames, 0, 0)
+	return err
+}
+
+func (s *announcedLabelSetsStore) UpdateFromSources(ctx context.Context, sources []announcedLabelSource, labelNames []string, sourceTimeout, lookback time.Duration) ([]announcedLabelSourceFailure, error) {
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("no announced label sources configured")
 	}
+	startTime, endTime, err := announcedLabelTimeRange(lookback)
+	if err != nil {
+		return nil, err
+	}
+
+	labelSets := make([]labels.Labels, 0)
+	seen := make(map[string]struct{})
+	failures := make([]announcedLabelSourceFailure, 0)
+	successfulSources := 0
+
+	for _, source := range sources {
+		sourceCtx := ctx
+		cancel := func() {}
+		if sourceTimeout > 0 {
+			sourceCtx, cancel = context.WithTimeout(ctx, sourceTimeout)
+		}
+		sourceLabelSets, err := announcedLabelSetsFromBackend(sourceCtx, source.client, labelNames, startTime, endTime)
+		cancel()
+		if err != nil {
+			failures = append(failures, announcedLabelSourceFailure{source: source.name, err: err})
+			continue
+		}
+
+		successfulSources++
+		for _, labelSet := range sourceLabelSets {
+			key := labelSet.String()
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			labelSets = append(labelSets, labelSet)
+		}
+	}
+
+	if successfulSources == 0 {
+		return failures, announcedLabelSourceFailuresError(failures)
+	}
+
+	sort.Slice(labelSets, func(i, j int) bool {
+		return labelSets[i].String() < labelSets[j].String()
+	})
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	s.labelSets = labelSets
-	return nil
+	return failures, nil
 }
 
-func announcedLabelSetsFromBackend(ctx context.Context, client queryBackendAPI, labelNames []string) ([]labels.Labels, error) {
+func announcedLabelTimeRange(lookback time.Duration) (time.Time, time.Time, error) {
+	if lookback < 0 {
+		return time.Time{}, time.Time{}, fmt.Errorf("query.announce-label-lookback must be greater than or equal to zero")
+	}
+	if lookback == 0 {
+		return time.Time{}, time.Time{}, nil
+	}
+
+	endTime := time.Now().UTC()
+	return endTime.Add(-lookback), endTime, nil
+}
+
+func announcedLabelSetsFromBackend(ctx context.Context, client queryBackendAPI, labelNames []string, startTime, endTime time.Time) ([]labels.Labels, error) {
 	labelSets := make([]labels.Labels, 0)
 	seen := make(map[string]struct{})
 
@@ -707,7 +782,7 @@ func announcedLabelSetsFromBackend(ctx context.Context, client queryBackendAPI, 
 			return nil, fmt.Errorf("invalid announced label name %q", labelName)
 		}
 
-		values, _, err := client.LabelValues(ctx, labelName, nil, time.Time{}, time.Time{})
+		values, _, err := client.LabelValues(ctx, labelName, nil, startTime, endTime)
 		if err != nil {
 			return nil, fmt.Errorf("read values for announced label %q: %w", labelName, err)
 		}
@@ -725,6 +800,106 @@ func announcedLabelSetsFromBackend(ctx context.Context, client queryBackendAPI, 
 		return labelSets[i].String() < labelSets[j].String()
 	})
 	return labelSets, nil
+}
+
+func createAnnouncedLabelSources(queryConfig queryBackendConfig) ([]announcedLabelSource, error) {
+	sourceConfigs := announcedLabelSourceConfigs(queryConfig)
+	sources := make([]announcedLabelSource, 0, len(sourceConfigs))
+	for _, sourceConfig := range sourceConfigs {
+		client, err := createQueryBackendClient(sourceConfig.config)
+		if err != nil {
+			return nil, fmt.Errorf("create announced label source %q: %w", sourceConfig.name, err)
+		}
+		sources = append(sources, announcedLabelSource{
+			name:   sourceConfig.name,
+			client: client,
+		})
+	}
+	return sources, nil
+}
+
+func announcedLabelSourceConfigs(queryConfig queryBackendConfig) []announcedLabelSourceConfig {
+	headerName, headerValue, ok := headerValue(queryConfig.Headers, "X-Scope-OrgID")
+	if !ok {
+		return []announcedLabelSourceConfig{{name: "backend", config: queryConfig}}
+	}
+
+	tenants := splitTenantHeader(headerValue)
+	if len(tenants) == 0 {
+		return []announcedLabelSourceConfig{{name: "backend", config: queryConfig}}
+	}
+
+	sourceConfigs := make([]announcedLabelSourceConfig, 0, len(tenants))
+	for _, tenant := range tenants {
+		sourceConfig := queryConfig
+		sourceConfig.Headers = cloneHeaders(queryConfig.Headers)
+		sourceConfig.Headers[headerName] = tenant
+		sourceConfigs = append(sourceConfigs, announcedLabelSourceConfig{
+			name:   tenant,
+			config: sourceConfig,
+		})
+	}
+	return sourceConfigs
+}
+
+func headerValue(headers map[string]string, name string) (string, string, bool) {
+	for headerName, headerValue := range headers {
+		if strings.EqualFold(headerName, name) {
+			return headerName, headerValue, true
+		}
+	}
+	return "", "", false
+}
+
+func splitTenantHeader(value string) []string {
+	parts := strings.Split(value, "|")
+	tenants := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		tenants = append(tenants, part)
+	}
+	return tenants
+}
+
+func cloneHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	result := make(map[string]string, len(headers))
+	for name, value := range headers {
+		result[name] = value
+	}
+	return result
+}
+
+func announcedLabelSourceFailuresError(failures []announcedLabelSourceFailure) error {
+	if len(failures) == 0 {
+		return fmt.Errorf("all announced label sources failed")
+	}
+
+	messages := make([]string, 0, len(failures))
+	for _, failure := range failures {
+		messages = append(messages, fmt.Sprintf("%s: %s", failure.source, failure.err))
+	}
+	return fmt.Errorf("all announced label sources failed: %s", strings.Join(messages, "; "))
+}
+
+func logAnnouncedLabelSourceFailures(logger log.Logger, failures []announcedLabelSourceFailure) {
+	for _, failure := range failures {
+		level.Warn(logger).Log("msg", "loading announced label sets from source failed", "source", failure.source, "err", failure.err)
+	}
+}
+
+func announcedLabelSourceNames(sources []announcedLabelSource) []string {
+	names := make([]string, 0, len(sources))
+	for _, source := range sources {
+		names = append(names, source.name)
+	}
+	return names
 }
 
 func announcedLabelSetsFromValues(labelName string, values model.LabelValues) []labels.Labels {
@@ -964,6 +1139,7 @@ func main() {
 	externalLabels := newExternalLabelsStore()
 	announcedLabelSets := newAnnouncedLabelSetsStore()
 	announcedLabelNames := queryAnnounceLabels.values()
+	var announcedLabelSources []announcedLabelSource
 
 	externalLabelsClient := queryBackendClient
 	if *queryExternalLabelsURL != "" {
@@ -998,10 +1174,19 @@ func main() {
 			level.Error(logger).Log("msg", "query.announce-label-timeout must be greater than zero")
 			os.Exit(1)
 		}
+		if *queryAnnounceLabelLookback < 0 {
+			level.Error(logger).Log("msg", "query.announce-label-lookback must be greater than or equal to zero")
+			os.Exit(1)
+		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), *queryAnnounceLabelTimeout)
-		err = announcedLabelSets.UpdateFromBackend(ctx, queryBackendClient, announcedLabelNames)
-		cancel()
+		announcedLabelSources, err = createAnnouncedLabelSources(*queryConfig)
+		if err != nil {
+			level.Error(logger).Log("msg", "Error creating announced label sources", "err", err)
+			os.Exit(1)
+		}
+
+		failures, err := announcedLabelSets.UpdateFromSources(context.Background(), announcedLabelSources, announcedLabelNames, *queryAnnounceLabelTimeout, *queryAnnounceLabelLookback)
+		logAnnouncedLabelSourceFailures(logger, failures)
 		if err != nil {
 			level.Error(logger).Log("msg", "Error loading initial announced label sets", "err", err)
 			os.Exit(1)
@@ -1010,7 +1195,7 @@ func main() {
 			level.Error(logger).Log("msg", "no announced label values found on backend", "labels", fmt.Sprint(announcedLabelNames))
 			os.Exit(1)
 		}
-		level.Info(logger).Log("msg", "successfully loaded backend announced label sets", "labels", fmt.Sprint(announcedLabelNames), "label_sets", fmt.Sprint(announcedLabelSets.LabelSets()))
+		level.Info(logger).Log("msg", "successfully loaded backend announced label sets", "labels", fmt.Sprint(announcedLabelNames), "sources", fmt.Sprint(announcedLabelSourceNames(announcedLabelSources)), "lookback", queryAnnounceLabelLookback.String(), "label_sets", fmt.Sprint(announcedLabelSets.LabelSets()))
 	}
 
 	var g run.Group
@@ -1065,14 +1250,13 @@ func main() {
 			for {
 				select {
 				case <-ticker.C:
-					iterCtx, iterCancel := context.WithTimeout(context.Background(), *queryAnnounceLabelTimeout)
-					err := announcedLabelSets.UpdateFromBackend(iterCtx, queryBackendClient, announcedLabelNames)
-					iterCancel()
+					failures, err := announcedLabelSets.UpdateFromSources(ctx, announcedLabelSources, announcedLabelNames, *queryAnnounceLabelTimeout, *queryAnnounceLabelLookback)
+					logAnnouncedLabelSourceFailures(logger, failures)
 					if err != nil {
 						level.Warn(logger).Log("msg", "updating announced label sets failed", "err", err)
 						continue
 					}
-					level.Info(logger).Log("msg", "updated backend announced label sets", "labels", fmt.Sprint(announcedLabelNames), "label_sets", fmt.Sprint(announcedLabelSets.LabelSets()))
+					level.Info(logger).Log("msg", "updated backend announced label sets", "labels", fmt.Sprint(announcedLabelNames), "sources", fmt.Sprint(announcedLabelSourceNames(announcedLabelSources)), "lookback", queryAnnounceLabelLookback.String(), "label_sets", fmt.Sprint(announcedLabelSets.LabelSets()))
 				case <-ctx.Done():
 					return nil
 				}

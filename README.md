@@ -120,6 +120,7 @@ label in StoreAPI `Info`:
 ```bash
 --query.announce-label=prometheus
 --query.announce-label-refresh=1m
+--query.announce-label-lookback=6h
 ```
 
 With a Mimir target URL such as `http://mimir-querier:8080/prometheus`, this
@@ -131,6 +132,12 @@ uses the Prometheus-compatible label values endpoint:
 
 The connector sends the same static headers configured with `--query.header`, so
 tenant federation headers such as `X-Scope-OrgID` are included in this request.
+
+When `--query.announce-label-lookback` is greater than zero, the connector adds
+`start=now-lookback` and `end=now` to the label values request. This is useful
+with Mimir backends where unbounded label discovery may try to inspect old
+blocks through store-gateway. The lookback affects only StoreAPI `Info`
+labelset discovery; it does not limit QueryAPI or StoreAPI data queries.
 
 This changes only the label sets shown by Thanos Querier for this endpoint. The
 announced label remains a normal series label, and StoreAPI matchers for it are
