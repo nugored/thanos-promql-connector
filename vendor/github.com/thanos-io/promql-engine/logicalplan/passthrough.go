@@ -4,11 +4,11 @@
 package logicalplan
 
 import (
-	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/util/annotations"
-
 	"github.com/thanos-io/promql-engine/api"
 	"github.com/thanos-io/promql-engine/query"
+
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/util/annotations"
 )
 
 // PassthroughOptimizer optimizes queries which can be simply passed
@@ -52,6 +52,7 @@ func (m PassthroughOptimizer) Optimize(plan Node, opts *query.Options) (Node, an
 			Engine:          engines[0],
 			Query:           plan.Clone(),
 			QueryRangeStart: opts.Start,
+			QueryRangeEnd:   opts.End,
 		}, nil
 	}
 
@@ -59,26 +60,30 @@ func (m PassthroughOptimizer) Optimize(plan Node, opts *query.Options) (Node, an
 		return plan, nil
 	}
 
-	matchingLabelsEngines := make([]api.RemoteEngine, 0, len(engines))
+	matchingEngines := make(map[api.RemoteEngine]struct{})
 	TraverseBottomUp(nil, &plan, func(parent, current *Node) (stop bool) {
 		if vs, ok := (*current).(*VectorSelector); ok {
 			for _, e := range engines {
 				if !labelSetsMatch(vs.LabelMatchers, e.LabelSets()...) {
 					continue
 				}
-
-				matchingLabelsEngines = append(matchingLabelsEngines, e)
+				matchingEngines[e] = struct{}{}
 			}
 		}
 		return false
 	})
 
-	if len(matchingLabelsEngines) == 1 && matchingEngineTime(matchingLabelsEngines[0], opts) {
-		return RemoteExecution{
-			Engine:          matchingLabelsEngines[0],
-			Query:           plan.Clone(),
-			QueryRangeStart: opts.Start,
-		}, nil
+	if len(matchingEngines) == 1 {
+		for e := range matchingEngines {
+			if matchingEngineTime(e, opts) {
+				return RemoteExecution{
+					Engine:          e,
+					Query:           plan.Clone(),
+					QueryRangeStart: opts.Start,
+					QueryRangeEnd:   opts.End,
+				}, nil
+			}
+		}
 	}
 
 	return plan, nil

@@ -9,7 +9,7 @@ See the `examples` directory for `docker compose` setups.
 1. Start the connector with your desired query target:
 
 ```bash
-go run . \
+go run -tags slicelabels . \
     --query.target-url=http://127.0.0.1:18080/prometheus
 ```
 
@@ -17,7 +17,7 @@ go run . \
 ```bash
 git clone https://github.com/thanos-io/thanos.git
 cd thanos
-go run ./cmd/thanos query --endpoint :8081 --query.mode distributed --query.promql-engine thanos
+go run -tags slicelabels ./cmd/thanos query --endpoint :8081 --query.mode distributed --query.promql-engine thanos
 ```
 
 3. View Thanos Querier UI at address [0.0.0.0:10902](http://localhost:10902/).
@@ -28,17 +28,64 @@ Static headers can be added to every proxied PromQL backend request with `--quer
 The flag can be repeated and accepts `Name=Value` or `Name: Value`:
 
 ```bash
-go run . \
+go run -tags slicelabels . \
     --query.target-url=http://127.0.0.1:18080/prometheus \
     '--query.header=X-Scope-OrgID=tenant1|tenant2'
 ```
+
+## Build
+
+The connector uses Thanos `v0.42.2` libraries. Build and test with the
+`slicelabels` Go tag; this is the default in the Dockerfile and Makefile:
+
+```bash
+make test
+make build
+make build-push
+```
+
+For direct local commands:
+
+```bash
+go test -tags slicelabels ./...
+go build -tags slicelabels .
+```
+
+## Backend Query Parameters
+
+Static query parameters can be added to every backend Prometheus API request
+with `--query.param`. The flag can be repeated and accepts `Name=Value`.
+
+This is mainly useful when the backend is a Thanos Querier and you need to pass
+Thanos-specific parameters such as `storeMatch[]`:
+
+```bash
+go run -tags slicelabels . \
+    --query.target-url=http://thanos-query-backend:10902 \
+    '--query.param=storeMatch[]={cluster="prod"}'
+```
+
+Do not point `--query.target-url` at the same Thanos Querier that has this
+connector configured as an endpoint. That creates a recursive path:
+
+```text
+Thanos Querier -> StoreAPI connector -> backend HTTP query_range -> same Thanos Querier -> StoreAPI connector -> ...
+```
+
+With the Thanos PromQL engine, that loop can surface as a warning like
+`runtime error: invalid memory address or nil pointer dereference`, even for a
+plain selector such as `prometheus_tsdb_head_max_time_seconds{prometheus=~".*"}`.
+Point the connector at Mimir Querier directly, or at a separate Thanos Querier
+that does not include the connector as an endpoint. If you intentionally use a
+Thanos Querier backend, use `storeMatch[]` to select only stores whose announced
+external labels cannot match the connector.
 
 ## Google Auth
 
 Google auth can be enabled with startup parameters:
 
 ```bash
-go run . \
+go run -tags slicelabels . \
     --query.target-url=https://monitoring.googleapis.com/v1/projects/<PROJECT_ID>/location/global/prometheus \
     --query.auth.credentials-file=/key.json \
     --query.auth.scope=https://www.googleapis.com/auth/monitoring.read
@@ -62,6 +109,33 @@ clamp. It does not disable Mimir's own query limit, so long high-resolution
 queries can still fail with backend errors such as `exceeded maximum resolution
 of 11,000 points per timeseries`. Keep this value aligned with the backend limit,
 or increase the limit in Mimir if you need finer resolution over long ranges.
+
+## Thanos Endpoint Discovery
+
+The connector registers both the Thanos StoreAPI and QueryAPI gRPC services. The
+`--grpc-info-api-mode` flag controls which API is advertised to Thanos Querier in
+the Info response:
+
+```bash
+--grpc-info-api-mode=store # default: advertise StoreAPI only
+--grpc-info-api-mode=query # advertise QueryAPI only
+--grpc-info-api-mode=both  # advertise both StoreAPI and QueryAPI
+```
+
+Use `query` mode when you want Thanos Querier to avoid creating a StoreAPI client
+for the connector. This can be useful for testing Thanos versions where StoreAPI
+series consumption regresses.
+
+One caveat: current Thanos versions derive remote QueryAPI time and label routing
+metadata from `Info.store.tsdbInfos`. In `query` mode the connector intentionally
+omits `Info.store`, so QueryAPI-only discovery can bypass StoreAPI but may lose
+announced labelset/time metadata in Thanos' remote execution planner. If Thanos
+does not query the endpoint in `query` mode, use `store` mode with a Thanos build
+that handles StoreAPI correctly, for example `v0.39.1` or a fixed `v0.41.x`
+build.
+
+The old `--grpc-info-advertise-query-api` flag is kept for compatibility. When
+used with the default mode, it maps to `--grpc-info-api-mode=both`.
 
 ## gRPC TLS
 
@@ -94,7 +168,7 @@ With one-way TLS and your Querier-side settings, Thanos Querier can connect with
 The connector only validates the Querier client certificate when
 `--grpc-server-tls-client-ca` is configured.
 
-The connector also registers Thanos' `snappy` gRPC compressor, so it can accept
+The connector also registers a `snappy` gRPC compressor, so it can accept
 metadata and query calls from Querier when Querier is started with:
 
 ```bash
