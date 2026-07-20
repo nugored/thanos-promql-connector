@@ -30,7 +30,6 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/thanos/pkg/api/query/querypb"
 	"github.com/thanos-io/thanos/pkg/component"
-	_ "github.com/thanos-io/thanos/pkg/extgrpc/snappy"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -46,6 +45,7 @@ import (
 var (
 	queryTargetURL      = flag.String("query.target-url", "", "PromQL HTTP API backend URL.")
 	queryHeaders        headerFlags
+	queryParams         queryParamFlags
 	queryAuthScopes     stringListFlag
 	queryDropLabels     stringListFlag
 	queryAnnounceLabels stringListFlag
@@ -75,12 +75,17 @@ var (
 		"TLS private key file for the gRPC server. Requires grpc-server-tls-cert when set.")
 	grpcServerTLSClientCAFile = flag.String("grpc-server-tls-client-ca", "",
 		"Client CA certificate file for mTLS on the gRPC server. When set, client certificates are required and verified.")
+	grpcInfoAPIMode = flag.String("grpc-info-api-mode", string(infoAPIModeStore),
+		"API support to advertise in the Info response. Valid values: store, query, both.")
+	grpcInfoAdvertiseQueryAPI = flag.Bool("grpc-info-advertise-query-api", false,
+		"Deprecated: advertise both StoreAPI and QueryAPI support in the Info response when grpc-info-api-mode is left as store.")
 	metricsAddress = flag.String("metrics-address", ":9090",
 		"Address on which to expose metrics")
 )
 
 func init() {
 	flag.Var(&queryHeaders, "query.header", "Static header to add to backend requests, in Name=Value or Name: Value format. May be repeated.")
+	flag.Var(&queryParams, "query.param", "Static query parameter to add to every backend Prometheus API request, in Name=Value format. May be repeated.")
 	flag.Var(&queryAuthScopes, "query.auth.scope", "Google auth OAuth scope for backend requests. May be repeated or comma-separated.")
 	flag.Var(&queryDropLabels, "query.drop-label", "Label to remove from query and StoreAPI responses. May be repeated or comma-separated.")
 	flag.Var(&queryAnnounceLabels, "query.announce-label", "Backend label whose values should be advertised as StoreAPI Info label sets. May be repeated or comma-separated.")
@@ -99,6 +104,49 @@ type queryServer struct {
 	queryBackendClient queryBackendAPI
 	dropLabels         labelDropSet
 	externalLabels     func() labels.Labels
+}
+
+type infoAPIMode string
+
+const (
+	infoAPIModeStore infoAPIMode = "store"
+	infoAPIModeQuery infoAPIMode = "query"
+	infoAPIModeBoth  infoAPIMode = "both"
+)
+
+func parseInfoAPIMode(value string, advertiseQueryAPI bool) (infoAPIMode, error) {
+	mode := infoAPIMode(strings.ToLower(strings.TrimSpace(value)))
+	if mode == "" {
+		mode = infoAPIModeStore
+	}
+	switch mode {
+	case infoAPIModeStore:
+		if advertiseQueryAPI {
+			return infoAPIModeBoth, nil
+		}
+		return infoAPIModeStore, nil
+	case infoAPIModeQuery, infoAPIModeBoth:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("grpc-info-api-mode must be one of store, query, or both")
+	}
+}
+
+func (mode infoAPIMode) effective() infoAPIMode {
+	if mode == "" {
+		return infoAPIModeStore
+	}
+	return mode
+}
+
+func (mode infoAPIMode) advertisesStoreAPI() bool {
+	mode = mode.effective()
+	return mode == infoAPIModeStore || mode == infoAPIModeBoth
+}
+
+func (mode infoAPIMode) advertisesQueryAPI() bool {
+	mode = mode.effective()
+	return mode == infoAPIModeQuery || mode == infoAPIModeBoth
 }
 
 func newQueryServer(queryBackendClient queryBackendAPI, dropLabels []string, externalLabels func() labels.Labels) *queryServer {
@@ -155,18 +203,26 @@ func (qs *queryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 	}
 
 	var sent int64
+	seriesSet := make([]storepb.Series, 0, len(matrix))
 	for _, result := range matrix {
+		if result == nil || len(result.Values) == 0 {
+			continue
+		}
 		chunks, err := chunksFromModelSamples(result.Values)
 		if err != nil {
 			return status.Error(codes.Internal, err.Error())
 		}
-		if err := server.Send(storepb.NewSeriesResponse(&storepb.Series{
+		seriesSet = append(seriesSet, storepb.Series{
 			Labels: qs.dropLabels.zLabelsFromMetric(result.Metric, externalLabels, request.WithoutReplicaLabels),
 			Chunks: chunks,
-		})); err != nil {
+		})
+	}
+	sortStoreSeries(seriesSet)
+
+	for i := range seriesSet {
+		if err := server.Send(storepb.NewSeriesResponse(&seriesSet[i])); err != nil {
 			return err
 		}
-
 		sent++
 		if request.Limit > 0 && sent >= request.Limit {
 			return nil
@@ -262,6 +318,9 @@ func (qs *queryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryS
 	switch results := values.(type) {
 	case model.Vector:
 		for _, result := range results {
+			if result == nil {
+				continue
+			}
 			series := &prompb.TimeSeries{
 				Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
 				Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, qs.externalLabels(), nil),
@@ -271,6 +330,9 @@ func (qs *queryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryS
 			}
 		}
 	case *model.Scalar:
+		if results == nil {
+			return nil
+		}
 		series := &prompb.TimeSeries{Samples: []prompb.Sample{{Value: float64(results.Value), Timestamp: int64(results.Timestamp)}}}
 		return srv.Send(querypb.NewQueryResponse(series))
 	}
@@ -299,6 +361,9 @@ func (qs *queryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 	switch results := values.(type) {
 	case model.Matrix:
 		for _, result := range results {
+			if result == nil || len(result.Values) == 0 {
+				continue
+			}
 			series := &prompb.TimeSeries{
 				Samples: samplesFromModel(result.Values),
 				Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, qs.externalLabels(), nil),
@@ -309,6 +374,9 @@ func (qs *queryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 		}
 	case model.Vector:
 		for _, result := range results {
+			if result == nil {
+				continue
+			}
 			series := &prompb.TimeSeries{
 				Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
 				Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, qs.externalLabels(), nil),
@@ -318,6 +386,9 @@ func (qs *queryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 			}
 		}
 	case *model.Scalar:
+		if results == nil {
+			return nil
+		}
 		series := &prompb.TimeSeries{Samples: []prompb.Sample{{Value: float64(results.Value), Timestamp: int64(results.Timestamp)}}}
 		return srv.Send(querypb.NewQueryRangeResponse(series))
 	}
@@ -335,13 +406,18 @@ func (qs *queryServer) sendSeriesMetadata(request *storepb.SeriesRequest, server
 	}
 
 	var sent int64
+	seriesSet := make([]storepb.Series, 0, len(labelSets))
 	for _, labelSet := range labelSets {
-		if err := server.Send(storepb.NewSeriesResponse(&storepb.Series{
+		seriesSet = append(seriesSet, storepb.Series{
 			Labels: qs.dropLabels.zLabelsFromLabelSet(labelSet, externalLabels, request.WithoutReplicaLabels),
-		})); err != nil {
+		})
+	}
+	sortStoreSeries(seriesSet)
+
+	for i := range seriesSet {
+		if err := server.Send(storepb.NewSeriesResponse(&seriesSet[i])); err != nil {
 			return err
 		}
-
 		sent++
 		if request.Limit > 0 && sent >= request.Limit {
 			return nil
@@ -627,6 +703,20 @@ func chunkFromModelSamples(samples []model.SamplePair) (storepb.AggrChunk, error
 			Data: xorChunk.Bytes(),
 		},
 	}, nil
+}
+
+func sortStoreSeries(seriesSet []storepb.Series) {
+	for i := range seriesSet {
+		sort.Slice(seriesSet[i].Chunks, func(a, b int) bool {
+			return seriesSet[i].Chunks[a].Compare(seriesSet[i].Chunks[b]) > 0
+		})
+	}
+	sort.Slice(seriesSet, func(i, j int) bool {
+		return labels.Compare(
+			labelpb.ZLabelsToPromLabels(seriesSet[i].Labels),
+			labelpb.ZLabelsToPromLabels(seriesSet[j].Labels),
+		) < 0
+	})
 }
 
 func sendStoreWarnings(server storepb.Store_SeriesServer, warnings v1.Warnings) error {
@@ -950,6 +1040,7 @@ type infoServer struct {
 	queryBackend       string
 	externalLabels     func() labels.Labels
 	announcedLabelSets func() []labels.Labels
+	apiMode            infoAPIMode
 }
 
 func (info *infoServer) Info(ctx context.Context, in *infopb.InfoRequest) (*infopb.InfoResponse, error) {
@@ -974,16 +1065,28 @@ func (info *infoServer) Info(ctx context.Context, in *infopb.InfoRequest) (*info
 		}
 	}
 
-	return &infopb.InfoResponse{
-		ComponentType: component.Query.String(),
-		LabelSets:     labelSets,
-		Store: &infopb.StoreInfo{
+	componentType := component.Store.String()
+	var queryInfo *infopb.QueryAPIInfo
+	if info.apiMode.advertisesQueryAPI() {
+		componentType = component.Query.String()
+		queryInfo = &infopb.QueryAPIInfo{}
+	}
+
+	var storeInfo *infopb.StoreInfo
+	if info.apiMode.advertisesStoreAPI() {
+		storeInfo = &infopb.StoreInfo{
 			MinTime:                      math.MinInt64,
 			MaxTime:                      math.MaxInt64,
 			SupportsWithoutReplicaLabels: true,
 			TsdbInfos:                    tsdbInfos,
-		},
-		Query: &infopb.QueryAPIInfo{},
+		}
+	}
+
+	return &infopb.InfoResponse{
+		ComponentType: componentType,
+		LabelSets:     labelSets,
+		Store:         storeInfo,
+		Query:         queryInfo,
 	}, nil
 }
 
@@ -1066,8 +1169,12 @@ func createQueryBackendClient(queryConfig queryBackendConfig) (queryBackendAPI, 
 	if err != nil {
 		return nil, err
 	}
+	targetURL, err := backendTargetURL(queryConfig)
+	if err != nil {
+		return nil, err
+	}
 	client, err := api.NewClient(api.Config{
-		Address:      queryConfig.QueryTargetURL,
+		Address:      targetURL,
 		RoundTripper: transport,
 	})
 	if err != nil {
@@ -1124,8 +1231,13 @@ func main() {
 	logger = log.With(logger, "caller", log.DefaultCaller)
 
 	var err error
+	infoMode, err := parseInfoAPIMode(*grpcInfoAPIMode, *grpcInfoAdvertiseQueryAPI)
+	if err != nil {
+		level.Error(logger).Log("err", err)
+		os.Exit(1)
+	}
 	// Configuration Loading.
-	queryConfig, err := newQueryBackendConfig(*queryTargetURL, queryHeaders.values(), *queryAuthCredentialsFile, queryAuthScopes.values())
+	queryConfig, err := newQueryBackendConfig(*queryTargetURL, queryHeaders.values(), queryParams.values(), *queryAuthCredentialsFile, queryAuthScopes.values())
 	if err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
@@ -1288,6 +1400,7 @@ func main() {
 			queryBackend:       queryConfig.QueryTargetURL,
 			externalLabels:     externalLabels.Labels,
 			announcedLabelSets: announcedLabelSets.LabelSets,
+			apiMode:            infoMode,
 		})
 		g.Add(func() error {
 			level.Info(logger).Log("msg", "Starting grpc server for query endpoint", "listen", *connectorAddress, "tls", tlsEnabled, "mtls", *grpcServerTLSClientCAFile != "")

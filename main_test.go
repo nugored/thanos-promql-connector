@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -8,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"io"
 	"math/big"
 	"net/http"
 	"os"
@@ -22,6 +24,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/metadata"
 )
 
 func TestNewQueryBackendRoundTripperSkipsGoogleAuthWhenAuthEmpty(t *testing.T) {
@@ -67,6 +70,43 @@ func TestNewGRPCServerOptionsSkipsTLSWhenEmpty(t *testing.T) {
 func TestSnappyGRPCCompressorRegistered(t *testing.T) {
 	if encoding.GetCompressor("snappy") == nil {
 		t.Fatal("snappy gRPC compressor is not registered")
+	}
+}
+
+func TestSnappyGRPCCompressorReadRoundTrip(t *testing.T) {
+	compressor := encoding.GetCompressor("snappy")
+	if compressor == nil {
+		t.Fatal("snappy gRPC compressor is not registered")
+	}
+
+	payload := bytes.Repeat([]byte("promql-connector grpc request payload "), 256)
+	var compressed bytes.Buffer
+	writer, err := compressor.Compress(&compressed)
+	if err != nil {
+		t.Fatalf("Compress() returned error: %v", err)
+	}
+	if _, err := writer.Write(payload); err != nil {
+		t.Fatalf("Write() returned error: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() returned error: %v", err)
+	}
+
+	reader, err := compressor.Decompress(bytes.NewReader(compressed.Bytes()))
+	if err != nil {
+		t.Fatalf("Decompress() returned error: %v", err)
+	}
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll() returned error: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("decompressed payload mismatch: got %d bytes, want %d", len(got), len(payload))
+	}
+
+	n, err := reader.Read(make([]byte, 1))
+	if n != 0 || err != io.EOF {
+		t.Fatalf("Read() after EOF = %d, %v; want 0, EOF", n, err)
 	}
 }
 
@@ -169,6 +209,36 @@ func TestHeaderFlagsSetRejectsInvalidValue(t *testing.T) {
 	}
 }
 
+func TestQueryParamFlagsSet(t *testing.T) {
+	var params queryParamFlags
+
+	if err := params.Set(`storeMatch[]={connector!="thanos-promql-connector"}`); err != nil {
+		t.Fatalf("params.Set() returned error: %v", err)
+	}
+	if err := params.Set("dedup=false"); err != nil {
+		t.Fatalf("params.Set() returned error: %v", err)
+	}
+
+	want := map[string][]string{
+		"dedup":        {"false"},
+		"storeMatch[]": {`{connector!="thanos-promql-connector"}`},
+	}
+	if got := params.values(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("params.values() = %v, want %v", got, want)
+	}
+}
+
+func TestQueryParamFlagsSetRejectsInvalidValue(t *testing.T) {
+	var params queryParamFlags
+
+	if err := params.Set("missing-separator"); err == nil {
+		t.Fatal("params.Set() succeeded, want error")
+	}
+	if err := params.Set(" =value"); err == nil {
+		t.Fatal("params.Set() succeeded with empty parameter name, want error")
+	}
+}
+
 func TestStringListFlagSet(t *testing.T) {
 	var values stringListFlag
 
@@ -186,7 +256,7 @@ func TestStringListFlagSet(t *testing.T) {
 }
 
 func TestNewQueryBackendConfigRequiresTargetURL(t *testing.T) {
-	if _, err := newQueryBackendConfig("", nil, "", nil); err == nil {
+	if _, err := newQueryBackendConfig("", nil, nil, "", nil); err == nil {
 		t.Fatal("newQueryBackendConfig() succeeded without target URL, want error")
 	}
 }
@@ -195,6 +265,7 @@ func TestNewQueryBackendConfigBuildsConfigFromStartupParameters(t *testing.T) {
 	cfg, err := newQueryBackendConfig(
 		" http://127.0.0.1:18080/prometheus ",
 		map[string]string{"X-Scope-OrgID": "tenant1|tenant2"},
+		map[string][]string{"storeMatch[]": {`{connector!="thanos-promql-connector"}`}},
 		" /key.json ",
 		[]string{" https://www.googleapis.com/auth/monitoring.read ", ""},
 	)
@@ -208,11 +279,31 @@ func TestNewQueryBackendConfigBuildsConfigFromStartupParameters(t *testing.T) {
 	if got := cfg.Headers; !reflect.DeepEqual(got, map[string]string{"X-Scope-OrgID": "tenant1|tenant2"}) {
 		t.Fatalf("Headers = %v", got)
 	}
+	if got := cfg.QueryParams; !reflect.DeepEqual(got, map[string][]string{"storeMatch[]": {`{connector!="thanos-promql-connector"}`}}) {
+		t.Fatalf("QueryParams = %v", got)
+	}
 	if cfg.Auth.CredentialsFile != "/key.json" {
 		t.Fatalf("CredentialsFile = %q", cfg.Auth.CredentialsFile)
 	}
 	if got := cfg.Auth.Scopes; !reflect.DeepEqual(got, []string{"https://www.googleapis.com/auth/monitoring.read"}) {
 		t.Fatalf("Scopes = %v", got)
+	}
+}
+
+func TestBackendTargetURLAppendsQueryParams(t *testing.T) {
+	got, err := backendTargetURL(queryBackendConfig{
+		QueryTargetURL: "http://thanos-query:10902/prometheus?dedup=true",
+		QueryParams: map[string][]string{
+			"storeMatch[]": {`{connector!="thanos-promql-connector"}`, `{cluster="prod"}`},
+		},
+	})
+	if err != nil {
+		t.Fatalf("backendTargetURL() returned error: %v", err)
+	}
+
+	want := "http://thanos-query:10902/prometheus?dedup=true&storeMatch%5B%5D=%7Bconnector%21%3D%22thanos-promql-connector%22%7D&storeMatch%5B%5D=%7Bcluster%3D%22prod%22%7D"
+	if got != want {
+		t.Fatalf("backendTargetURL() = %q, want %q", got, want)
 	}
 }
 
@@ -366,6 +457,127 @@ func TestChunksFromModelSamples(t *testing.T) {
 	}
 	if got := chunk.Raw.XORNumSamples(); got != 2 {
 		t.Fatalf("chunk.Raw.XORNumSamples() = %d, want 2", got)
+	}
+}
+
+func TestSeriesSkipsEmptyBackendStreams(t *testing.T) {
+	server := newQueryServer(fakeQueryBackendAPI{
+		queryRangeValue: model.Matrix{
+			&model.SampleStream{
+				Metric: model.Metric{"__name__": "up", "job": "empty"},
+			},
+			&model.SampleStream{
+				Metric: model.Metric{"__name__": "up", "job": "api"},
+				Values: []model.SamplePair{
+					{Timestamp: 1000, Value: 1},
+				},
+			},
+		},
+	}, nil, nil)
+	stream := &recordingStoreSeriesServer{ctx: context.Background()}
+
+	err := server.Series(&storepb.SeriesRequest{
+		MinTime: 0,
+		MaxTime: 2000,
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "up"},
+		},
+	}, stream)
+	if err != nil {
+		t.Fatalf("Series() returned error: %v", err)
+	}
+
+	if len(stream.responses) != 1 {
+		t.Fatalf("len(responses) = %d, want 1", len(stream.responses))
+	}
+	series := stream.responses[0].GetSeries()
+	if series == nil {
+		t.Fatal("response series is nil")
+	}
+	gotLabels := labelpb.ZLabelsToPromLabels(series.Labels).Map()
+	wantLabels := map[string]string{"__name__": "up", "job": "api"}
+	if !reflect.DeepEqual(gotLabels, wantLabels) {
+		t.Fatalf("series labels = %v, want %v", gotLabels, wantLabels)
+	}
+	if len(series.Chunks) != 1 {
+		t.Fatalf("len(series.Chunks) = %d, want 1", len(series.Chunks))
+	}
+}
+
+func TestSeriesSortsByFinalLabels(t *testing.T) {
+	server := newQueryServer(fakeQueryBackendAPI{
+		queryRangeValue: model.Matrix{
+			&model.SampleStream{
+				Metric: model.Metric{"__name__": "up", "job": "z"},
+				Values: []model.SamplePair{
+					{Timestamp: 1000, Value: 1},
+				},
+			},
+			&model.SampleStream{
+				Metric: model.Metric{"__name__": "up", "job": "a"},
+				Values: []model.SamplePair{
+					{Timestamp: 1000, Value: 1},
+				},
+			},
+		},
+	}, nil, nil)
+	stream := &recordingStoreSeriesServer{ctx: context.Background()}
+
+	err := server.Series(&storepb.SeriesRequest{
+		MinTime: 0,
+		MaxTime: 2000,
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "up"},
+		},
+	}, stream)
+	if err != nil {
+		t.Fatalf("Series() returned error: %v", err)
+	}
+	if len(stream.responses) != 2 {
+		t.Fatalf("len(responses) = %d, want 2", len(stream.responses))
+	}
+
+	got := []string{
+		labelpb.ZLabelsToPromLabels(stream.responses[0].GetSeries().Labels).Get("job"),
+		labelpb.ZLabelsToPromLabels(stream.responses[1].GetSeries().Labels).Get("job"),
+	}
+	want := []string{"a", "z"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("response order = %v, want %v", got, want)
+	}
+}
+
+func TestSeriesMetadataSortsByFinalLabels(t *testing.T) {
+	server := newQueryServer(fakeQueryBackendAPI{
+		seriesLabelSets: []model.LabelSet{
+			{"__name__": "up", "job": "z"},
+			{"__name__": "up", "job": "a"},
+		},
+	}, nil, nil)
+	stream := &recordingStoreSeriesServer{ctx: context.Background()}
+
+	err := server.Series(&storepb.SeriesRequest{
+		SkipChunks: true,
+		MinTime:    0,
+		MaxTime:    2000,
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "up"},
+		},
+	}, stream)
+	if err != nil {
+		t.Fatalf("Series() returned error: %v", err)
+	}
+	if len(stream.responses) != 2 {
+		t.Fatalf("len(responses) = %d, want 2", len(stream.responses))
+	}
+
+	got := []string{
+		labelpb.ZLabelsToPromLabels(stream.responses[0].GetSeries().Labels).Get("job"),
+		labelpb.ZLabelsToPromLabels(stream.responses[1].GetSeries().Labels).Get("job"),
+	}
+	want := []string{"a", "z"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("response order = %v, want %v", got, want)
 	}
 }
 
@@ -608,6 +820,12 @@ func TestInfoServerUsesAnnouncedLabelSets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Info() returned error: %v", err)
 	}
+	if resp.ComponentType != "store" {
+		t.Fatalf("Info().ComponentType = %q, want store", resp.ComponentType)
+	}
+	if resp.Query != nil {
+		t.Fatal("Info().Query is set, want nil by default")
+	}
 
 	got := make([]map[string]string, 0, len(resp.LabelSets))
 	for _, labelSet := range resp.LabelSets {
@@ -627,6 +845,87 @@ func TestInfoServerUsesAnnouncedLabelSets(t *testing.T) {
 	}
 	if !reflect.DeepEqual(gotTSDBs, want) {
 		t.Fatalf("Info().Store.TsdbInfos labels = %v, want %v", gotTSDBs, want)
+	}
+}
+
+func TestInfoServerCanAdvertiseQueryAPI(t *testing.T) {
+	info := &infoServer{
+		queryBackend: "http://backend.example",
+		apiMode:      infoAPIModeBoth,
+	}
+
+	resp, err := info.Info(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Info() returned error: %v", err)
+	}
+	if resp.ComponentType != "query" {
+		t.Fatalf("Info().ComponentType = %q, want query", resp.ComponentType)
+	}
+	if resp.Query == nil {
+		t.Fatal("Info().Query is nil, want QueryAPI info")
+	}
+	if resp.Store == nil {
+		t.Fatal("Info().Store is nil, want StoreAPI info")
+	}
+}
+
+func TestInfoServerCanAdvertiseQueryAPIOnly(t *testing.T) {
+	info := &infoServer{
+		queryBackend: "http://backend.example",
+		apiMode:      infoAPIModeQuery,
+		announcedLabelSets: func() []labels.Labels {
+			return []labels.Labels{labels.FromStrings("prometheus", "prom-a")}
+		},
+	}
+
+	resp, err := info.Info(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Info() returned error: %v", err)
+	}
+	if resp.ComponentType != "query" {
+		t.Fatalf("Info().ComponentType = %q, want query", resp.ComponentType)
+	}
+	if resp.Query == nil {
+		t.Fatal("Info().Query is nil, want QueryAPI info")
+	}
+	if resp.Store != nil {
+		t.Fatal("Info().Store is set, want nil in QueryAPI-only mode")
+	}
+	if got := labelpb.ZLabelsToPromLabels(resp.LabelSets[0].Labels).Map(); !reflect.DeepEqual(got, map[string]string{"prometheus": "prom-a"}) {
+		t.Fatalf("Info().LabelSets[0] = %v, want prometheus label set", got)
+	}
+}
+
+func TestParseInfoAPIMode(t *testing.T) {
+	for _, testCase := range []struct {
+		name              string
+		value             string
+		advertiseQueryAPI bool
+		want              infoAPIMode
+		wantErr           bool
+	}{
+		{name: "default store", value: "", want: infoAPIModeStore},
+		{name: "store", value: "store", want: infoAPIModeStore},
+		{name: "query", value: "query", want: infoAPIModeQuery},
+		{name: "both", value: "both", want: infoAPIModeBoth},
+		{name: "legacy advertise query", value: "store", advertiseQueryAPI: true, want: infoAPIModeBoth},
+		{name: "invalid", value: "bad", wantErr: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got, err := parseInfoAPIMode(testCase.value, testCase.advertiseQueryAPI)
+			if testCase.wantErr {
+				if err == nil {
+					t.Fatal("parseInfoAPIMode() succeeded, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseInfoAPIMode() returned error: %v", err)
+			}
+			if got != testCase.want {
+				t.Fatalf("parseInfoAPIMode() = %q, want %q", got, testCase.want)
+			}
+		})
 	}
 }
 
@@ -682,6 +981,9 @@ func TestExternalLabelsOverrideResultLabels(t *testing.T) {
 type fakeQueryBackendAPI struct {
 	labelValues      map[string]model.LabelValues
 	labelValuesCalls *[]fakeLabelValuesCall
+	seriesLabelSets  []model.LabelSet
+	queryValue       model.Value
+	queryRangeValue  model.Value
 	err              error
 }
 
@@ -714,15 +1016,59 @@ func (f fakeQueryBackendAPI) LabelValues(ctx context.Context, label string, matc
 }
 
 func (f fakeQueryBackendAPI) Query(ctx context.Context, query string, ts time.Time, opts ...v1.Option) (model.Value, v1.Warnings, error) {
-	return nil, nil, nil
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	return f.queryValue, nil, nil
 }
 
 func (f fakeQueryBackendAPI) QueryRange(ctx context.Context, query string, r v1.Range, opts ...v1.Option) (model.Value, v1.Warnings, error) {
-	return nil, nil, nil
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	return f.queryRangeValue, nil, nil
 }
 
 func (f fakeQueryBackendAPI) Series(ctx context.Context, matches []string, startTime, endTime time.Time, opts ...v1.Option) ([]model.LabelSet, v1.Warnings, error) {
-	return nil, nil, nil
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	return f.seriesLabelSets, nil, nil
+}
+
+type recordingStoreSeriesServer struct {
+	ctx       context.Context
+	responses []*storepb.SeriesResponse
+}
+
+func (s *recordingStoreSeriesServer) Send(response *storepb.SeriesResponse) error {
+	s.responses = append(s.responses, response)
+	return nil
+}
+
+func (s *recordingStoreSeriesServer) SetHeader(metadata.MD) error {
+	return nil
+}
+
+func (s *recordingStoreSeriesServer) SendHeader(metadata.MD) error {
+	return nil
+}
+
+func (s *recordingStoreSeriesServer) SetTrailer(metadata.MD) {}
+
+func (s *recordingStoreSeriesServer) Context() context.Context {
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
+}
+
+func (s *recordingStoreSeriesServer) SendMsg(any) error {
+	return nil
+}
+
+func (s *recordingStoreSeriesServer) RecvMsg(any) error {
+	return nil
 }
 
 func writeTestCertificate(t *testing.T) (string, string) {

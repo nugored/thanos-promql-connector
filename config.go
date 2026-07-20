@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 )
@@ -10,6 +11,7 @@ import (
 type queryBackendConfig struct {
 	QueryTargetURL string
 	Headers        map[string]string
+	QueryParams    map[string][]string
 	Auth           queryBackendAuthConfig
 }
 
@@ -63,6 +65,45 @@ func (h headerFlags) values() map[string]string {
 	return result
 }
 
+type queryParamFlags map[string][]string
+
+func (p *queryParamFlags) String() string {
+	if p == nil || len(*p) == 0 {
+		return ""
+	}
+
+	pairs := make([]string, 0)
+	for name, values := range *p {
+		for _, value := range values {
+			pairs = append(pairs, fmt.Sprintf("%s=%s", name, value))
+		}
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, ",")
+}
+
+func (p *queryParamFlags) Set(value string) error {
+	equalsIndex := strings.Index(value, "=")
+	if equalsIndex < 0 {
+		return fmt.Errorf("query.param must be in Name=Value format")
+	}
+
+	name := strings.TrimSpace(value[:equalsIndex])
+	if name == "" {
+		return fmt.Errorf("query.param cannot contain an empty parameter name")
+	}
+
+	if *p == nil {
+		*p = make(map[string][]string)
+	}
+	(*p)[name] = append((*p)[name], strings.TrimSpace(value[equalsIndex+1:]))
+	return nil
+}
+
+func (p queryParamFlags) values() map[string][]string {
+	return cloneQueryParams(p)
+}
+
 func splitHeaderFlag(value string) (string, string, bool) {
 	equalsIndex := strings.Index(value, "=")
 	colonIndex := strings.Index(value, ":")
@@ -111,8 +152,12 @@ func (s stringListFlag) values() []string {
 	return result
 }
 
-func newQueryBackendConfig(queryTargetURL string, headers map[string]string, credentialsFile string, scopes []string) (*queryBackendConfig, error) {
+func newQueryBackendConfig(queryTargetURL string, headers map[string]string, queryParams map[string][]string, credentialsFile string, scopes []string) (*queryBackendConfig, error) {
 	normalizedHeaders, err := normalizeHeaders(headers)
+	if err != nil {
+		return nil, err
+	}
+	normalizedQueryParams, err := normalizeQueryParams(queryParams)
 	if err != nil {
 		return nil, err
 	}
@@ -120,6 +165,7 @@ func newQueryBackendConfig(queryTargetURL string, headers map[string]string, cre
 	cfg := &queryBackendConfig{
 		QueryTargetURL: strings.TrimSpace(queryTargetURL),
 		Headers:        normalizedHeaders,
+		QueryParams:    normalizedQueryParams,
 		Auth: queryBackendAuthConfig{
 			CredentialsFile: strings.TrimSpace(credentialsFile),
 			Scopes:          normalizeStrings(scopes),
@@ -130,6 +176,26 @@ func newQueryBackendConfig(queryTargetURL string, headers map[string]string, cre
 		return nil, fmt.Errorf("query.target-url flag must be set")
 	}
 	return cfg, nil
+}
+
+func backendTargetURL(config queryBackendConfig) (string, error) {
+	targetURL := strings.TrimSpace(config.QueryTargetURL)
+	if len(config.QueryParams) == 0 {
+		return targetURL, nil
+	}
+
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		return "", fmt.Errorf("parse query.target-url: %w", err)
+	}
+	values := parsedURL.Query()
+	for name, paramValues := range config.QueryParams {
+		for _, value := range paramValues {
+			values.Add(name, value)
+		}
+	}
+	parsedURL.RawQuery = values.Encode()
+	return parsedURL.String(), nil
 }
 
 func normalizeHeaders(headers map[string]string) (map[string]string, error) {
@@ -146,6 +212,36 @@ func normalizeHeaders(headers map[string]string) (map[string]string, error) {
 		result[name] = strings.TrimSpace(value)
 	}
 	return result, nil
+}
+
+func normalizeQueryParams(params map[string][]string) (map[string][]string, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+
+	result := make(map[string][]string, len(params))
+	for name, values := range params {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, fmt.Errorf("query params cannot contain an empty parameter name")
+		}
+		for _, value := range values {
+			result[name] = append(result[name], strings.TrimSpace(value))
+		}
+	}
+	return result, nil
+}
+
+func cloneQueryParams(params map[string][]string) map[string][]string {
+	if len(params) == 0 {
+		return nil
+	}
+
+	result := make(map[string][]string, len(params))
+	for name, values := range params {
+		result[name] = append([]string(nil), values...)
+	}
+	return result
 }
 
 func normalizeStrings(values []string) []string {
