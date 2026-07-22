@@ -3,6 +3,7 @@ module main.go
 go 1.26.0
 
 require (
+	cloud.google.com/go/auth v0.17.0
 	github.com/go-kit/log v0.2.1
 	github.com/gogo/status v1.1.1
 	github.com/klauspost/compress v1.18.2
@@ -17,7 +18,6 @@ require (
 )
 
 require (
-	cloud.google.com/go/auth v0.17.0 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	github.com/VictoriaMetrics/easyproto v1.1.3 // indirect

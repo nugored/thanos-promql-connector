@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -166,6 +167,7 @@ func TestQueryAuthEnabled(t *testing.T) {
 		want bool
 	}{
 		{name: "empty"},
+		{name: "google adc", auth: queryBackendAuthConfig{Google: true}, want: true},
 		{name: "credentials file", auth: queryBackendAuthConfig{CredentialsFile: "/key.json"}, want: true},
 		{name: "scopes", auth: queryBackendAuthConfig{Scopes: []string{"https://www.googleapis.com/auth/monitoring.read"}}, want: true},
 	}
@@ -174,6 +176,27 @@ func TestQueryAuthEnabled(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := queryAuthEnabled(tt.auth); got != tt.want {
 				t.Fatalf("queryAuthEnabled() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGoogleAuthScopes(t *testing.T) {
+	tests := []struct {
+		name string
+		auth queryBackendAuthConfig
+		want []string
+	}{
+		{name: "empty"},
+		{name: "google adc default", auth: queryBackendAuthConfig{Google: true}, want: []string{googleMonitoringReadScope}},
+		{name: "explicit scopes", auth: queryBackendAuthConfig{Google: true, Scopes: []string{"scope-a"}}, want: []string{"scope-a"}},
+		{name: "credentials file without google flag keeps empty scopes", auth: queryBackendAuthConfig{CredentialsFile: "/key.json"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := googleAuthScopes(tt.auth); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("googleAuthScopes() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -239,6 +262,34 @@ func TestQueryParamFlagsSetRejectsInvalidValue(t *testing.T) {
 	}
 }
 
+func TestLabelFlagsSet(t *testing.T) {
+	var values labelFlags
+
+	if err := values.Set("prometheus=gcp-project"); err != nil {
+		t.Fatalf("values.Set() returned error: %v", err)
+	}
+	if err := values.Set("region=global"); err != nil {
+		t.Fatalf("values.Set() returned error: %v", err)
+	}
+
+	want := map[string]string{"prometheus": "gcp-project", "region": "global"}
+	if got := values.values(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("values.values() = %v, want %v", got, want)
+	}
+}
+
+func TestLabelFlagsSetRejectsInvalidValue(t *testing.T) {
+	var values labelFlags
+
+	for _, value := range []string{"missing-separator", "=value", "invalid-name=value", "prometheus="} {
+		t.Run(value, func(t *testing.T) {
+			if err := values.Set(value); err == nil {
+				t.Fatal("values.Set() succeeded, want error")
+			}
+		})
+	}
+}
+
 func TestStringListFlagSet(t *testing.T) {
 	var values stringListFlag
 
@@ -255,8 +306,32 @@ func TestStringListFlagSet(t *testing.T) {
 	}
 }
 
+func TestNormalizeGCPProjectsDeduplicates(t *testing.T) {
+	got, err := normalizeGCPProjects([]string{"itk8s-208609", " space-prod ", "itk8s-208609"})
+	if err != nil {
+		t.Fatalf("normalizeGCPProjects() returned error: %v", err)
+	}
+
+	want := []string{"itk8s-208609", "space-prod"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalizeGCPProjects() = %v, want %v", got, want)
+	}
+}
+
+func TestGooglePrometheusTargetURL(t *testing.T) {
+	got, err := googlePrometheusTargetURL("itk8s-208609")
+	if err != nil {
+		t.Fatalf("googlePrometheusTargetURL() returned error: %v", err)
+	}
+
+	want := "https://monitoring.googleapis.com/v1/projects/itk8s-208609/location/global/prometheus"
+	if got != want {
+		t.Fatalf("googlePrometheusTargetURL() = %q, want %q", got, want)
+	}
+}
+
 func TestNewQueryBackendConfigRequiresTargetURL(t *testing.T) {
-	if _, err := newQueryBackendConfig("", nil, nil, "", nil); err == nil {
+	if _, err := newQueryBackendConfig("", nil, nil, false, "", nil); err == nil {
 		t.Fatal("newQueryBackendConfig() succeeded without target URL, want error")
 	}
 }
@@ -266,6 +341,7 @@ func TestNewQueryBackendConfigBuildsConfigFromStartupParameters(t *testing.T) {
 		" http://127.0.0.1:18080/prometheus ",
 		map[string]string{"X-Scope-OrgID": "tenant1|tenant2"},
 		map[string][]string{"storeMatch[]": {`{connector!="thanos-promql-connector"}`}},
+		true,
 		" /key.json ",
 		[]string{" https://www.googleapis.com/auth/monitoring.read ", ""},
 	)
@@ -281,6 +357,9 @@ func TestNewQueryBackendConfigBuildsConfigFromStartupParameters(t *testing.T) {
 	}
 	if got := cfg.QueryParams; !reflect.DeepEqual(got, map[string][]string{"storeMatch[]": {`{connector!="thanos-promql-connector"}`}}) {
 		t.Fatalf("QueryParams = %v", got)
+	}
+	if !cfg.Auth.Google {
+		t.Fatal("Auth.Google = false, want true")
 	}
 	if cfg.Auth.CredentialsFile != "/key.json" {
 		t.Fatalf("CredentialsFile = %q", cfg.Auth.CredentialsFile)
@@ -806,7 +885,7 @@ func TestInfoServerUsesAnnouncedLabelSets(t *testing.T) {
 	info := &infoServer{
 		queryBackend: "http://backend.example",
 		externalLabels: func() labels.Labels {
-			return labels.FromStrings("prometheus", "from-external")
+			return labels.FromStrings("region", "global")
 		},
 		announcedLabelSets: func() []labels.Labels {
 			return []labels.Labels{
@@ -832,8 +911,8 @@ func TestInfoServerUsesAnnouncedLabelSets(t *testing.T) {
 		got = append(got, labelpb.ZLabelsToPromLabels(labelSet.Labels).Map())
 	}
 	want := []map[string]string{
-		{"prometheus": "prom-a"},
-		{"prometheus": "prom-b"},
+		{"prometheus": "prom-a", "region": "global"},
+		{"prometheus": "prom-b", "region": "global"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Info().LabelSets = %v, want %v", got, want)
@@ -964,6 +1043,208 @@ func TestMatchesExternalLabelsRejectsMismatchedExternalMatchers(t *testing.T) {
 	}
 }
 
+func TestLabelValuesReturnsExternalLabelWithBackendMatchers(t *testing.T) {
+	server := newQueryServer(
+		fakeQueryBackendAPI{err: errors.New("backend should not be queried")},
+		nil,
+		func() labels.Labels { return labels.FromStrings("prometheus", "gcp-itk8s-208609") },
+	)
+
+	resp, err := server.LabelValues(context.Background(), &storepb.LabelValuesRequest{
+		Label: "prometheus",
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "logging_googleapis_com:byte_count"},
+			{Type: storepb.LabelMatcher_EQ, Name: "monitored_resource", Value: "gce_backend_service"},
+		},
+		Start: 1784717940000,
+		End:   1784721600000,
+	})
+	if err != nil {
+		t.Fatalf("LabelValues() returned error: %v", err)
+	}
+
+	want := []string{"gcp-itk8s-208609"}
+	if !reflect.DeepEqual(resp.Values, want) {
+		t.Fatalf("LabelValues().Values = %v, want %v", resp.Values, want)
+	}
+}
+
+func TestLabelValuesReturnsExternalLabelsForMultipleBackends(t *testing.T) {
+	server := newQueryServerFromBackends([]queryBackendEndpoint{
+		{
+			name:           "itk8s-208609",
+			client:         fakeQueryBackendAPI{err: errors.New("backend should not be queried")},
+			externalLabels: staticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-itk8s-208609")),
+		},
+		{
+			name:           "space-prod",
+			client:         fakeQueryBackendAPI{err: errors.New("backend should not be queried")},
+			externalLabels: staticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-space-prod")),
+		},
+	}, nil)
+
+	resp, err := server.LabelValues(context.Background(), &storepb.LabelValuesRequest{
+		Label: "prometheus",
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "logging_googleapis_com:byte_count"},
+			{Type: storepb.LabelMatcher_EQ, Name: "monitored_resource", Value: "gce_backend_service"},
+		},
+		Start: 1784717940000,
+		End:   1784721600000,
+	})
+	if err != nil {
+		t.Fatalf("LabelValues() returned error: %v", err)
+	}
+
+	want := []string{"gcp-itk8s-208609", "gcp-space-prod"}
+	if !reflect.DeepEqual(resp.Values, want) {
+		t.Fatalf("LabelValues().Values = %v, want %v", resp.Values, want)
+	}
+}
+
+func TestLabelValuesRoutesExternalLabelMatcherToOneBackend(t *testing.T) {
+	server := newQueryServerFromBackends([]queryBackendEndpoint{
+		{
+			name:           "itk8s-208609",
+			client:         fakeQueryBackendAPI{err: errors.New("backend should not be queried")},
+			externalLabels: staticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-itk8s-208609")),
+		},
+		{
+			name:           "space-prod",
+			client:         fakeQueryBackendAPI{err: errors.New("backend should not be queried")},
+			externalLabels: staticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-space-prod")),
+		},
+	}, nil)
+
+	resp, err := server.LabelValues(context.Background(), &storepb.LabelValuesRequest{
+		Label: "prometheus",
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "prometheus", Value: "gcp-space-prod"},
+			{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "logging_googleapis_com:byte_count"},
+			{Type: storepb.LabelMatcher_EQ, Name: "monitored_resource", Value: "gce_backend_service"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("LabelValues() returned error: %v", err)
+	}
+
+	want := []string{"gcp-space-prod"}
+	if !reflect.DeepEqual(resp.Values, want) {
+		t.Fatalf("LabelValues().Values = %v, want %v", resp.Values, want)
+	}
+}
+
+func TestLabelValuesReadsNonExternalLabelFromSelectedBackend(t *testing.T) {
+	itk8sCalls := make([]fakeLabelValuesCall, 0, 1)
+	spaceCalls := make([]fakeLabelValuesCall, 0, 1)
+	server := newQueryServerFromBackends([]queryBackendEndpoint{
+		{
+			name: "itk8s-208609",
+			client: fakeQueryBackendAPI{
+				labelValues: map[string]model.LabelValues{
+					"monitored_resource": {"gce_backend_service"},
+				},
+				labelValuesCalls: &itk8sCalls,
+			},
+			externalLabels: staticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-itk8s-208609")),
+		},
+		{
+			name: "space-prod",
+			client: fakeQueryBackendAPI{
+				labelValues: map[string]model.LabelValues{
+					"monitored_resource": {"k8s_container"},
+				},
+				labelValuesCalls: &spaceCalls,
+			},
+			externalLabels: staticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-space-prod")),
+		},
+	}, nil)
+
+	resp, err := server.LabelValues(context.Background(), &storepb.LabelValuesRequest{
+		Label: "monitored_resource",
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "prometheus", Value: "gcp-itk8s-208609"},
+			{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "logging_googleapis_com:byte_count"},
+			{Type: storepb.LabelMatcher_EQ, Name: "location", Value: "global"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("LabelValues() returned error: %v", err)
+	}
+
+	want := []string{"gce_backend_service"}
+	if !reflect.DeepEqual(resp.Values, want) {
+		t.Fatalf("LabelValues().Values = %v, want %v", resp.Values, want)
+	}
+	if len(itk8sCalls) != 1 {
+		t.Fatalf("itk8s LabelValues calls = %d, want 1", len(itk8sCalls))
+	}
+	if len(spaceCalls) != 0 {
+		t.Fatalf("space LabelValues calls = %d, want 0", len(spaceCalls))
+	}
+	call := itk8sCalls[0]
+	if call.label != "monitored_resource" {
+		t.Fatalf("LabelValues() label = %q, want monitored_resource", call.label)
+	}
+	if len(call.matches) != 1 {
+		t.Fatalf("LabelValues() matches = %v, want one selector", call.matches)
+	}
+	if strings.Contains(call.matches[0], "prometheus") {
+		t.Fatalf("LabelValues() backend selector = %q, want prometheus matcher stripped", call.matches[0])
+	}
+	if !strings.Contains(call.matches[0], `__name__="logging_googleapis_com:byte_count"`) || !strings.Contains(call.matches[0], `location="global"`) {
+		t.Fatalf("LabelValues() backend selector = %q, want backend matchers preserved", call.matches[0])
+	}
+}
+
+func TestRewriteQueryForExternalLabelsStripsMatchingMatcher(t *testing.T) {
+	got, match, err := rewriteQueryForExternalLabels(
+		`irate(frr_bgp_peer_message_received_total{afi="ipv4",prometheus="gcp-project"}[1m])`,
+		labels.FromStrings("prometheus", "gcp-project"),
+	)
+	if err != nil {
+		t.Fatalf("rewriteQueryForExternalLabels() returned error: %v", err)
+	}
+	if !match {
+		t.Fatal("rewriteQueryForExternalLabels() match = false, want true")
+	}
+	if strings.Contains(got, "prometheus") {
+		t.Fatalf("rewriteQueryForExternalLabels() = %q, want prometheus matcher stripped", got)
+	}
+	if !strings.Contains(got, `afi="ipv4"`) {
+		t.Fatalf("rewriteQueryForExternalLabels() = %q, want non-external matcher kept", got)
+	}
+}
+
+func TestRewriteQueryForExternalLabelsRejectsMismatchedMatcher(t *testing.T) {
+	_, match, err := rewriteQueryForExternalLabels(
+		`up{prometheus="other"}`,
+		labels.FromStrings("prometheus", "gcp-project"),
+	)
+	if err != nil {
+		t.Fatalf("rewriteQueryForExternalLabels() returned error: %v", err)
+	}
+	if match {
+		t.Fatal("rewriteQueryForExternalLabels() match = true, want false")
+	}
+}
+
+func TestRewriteQueryForExternalLabelsKeepsSelectorValid(t *testing.T) {
+	got, match, err := rewriteQueryForExternalLabels(
+		`{prometheus="gcp-project"}`,
+		labels.FromStrings("prometheus", "gcp-project"),
+	)
+	if err != nil {
+		t.Fatalf("rewriteQueryForExternalLabels() returned error: %v", err)
+	}
+	if !match {
+		t.Fatal("rewriteQueryForExternalLabels() match = false, want true")
+	}
+	if got != `{__name__=~".+"}` {
+		t.Fatalf("rewriteQueryForExternalLabels() = %q, want all-series selector", got)
+	}
+}
+
 func TestExternalLabelsOverrideResultLabels(t *testing.T) {
 	got := labelDropSet(nil).zLabelsFromMetric(
 		model.Metric{"__name__": "up", "prometheus": "from-result"},
@@ -989,6 +1270,7 @@ type fakeQueryBackendAPI struct {
 
 type fakeLabelValuesCall struct {
 	label     string
+	matches   []string
 	startTime time.Time
 	endTime   time.Time
 }
@@ -1005,6 +1287,7 @@ func (f fakeQueryBackendAPI) LabelValues(ctx context.Context, label string, matc
 	if f.labelValuesCalls != nil {
 		*f.labelValuesCalls = append(*f.labelValuesCalls, fakeLabelValuesCall{
 			label:     label,
+			matches:   append([]string(nil), matches...),
 			startTime: startTime,
 			endTime:   endTime,
 		})

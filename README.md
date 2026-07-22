@@ -80,16 +80,103 @@ that does not include the connector as an endpoint. If you intentionally use a
 Thanos Querier backend, use `storeMatch[]` to select only stores whose announced
 external labels cannot match the connector.
 
-## Google Auth
+## Google Managed Service for Prometheus
 
-Google auth can be enabled with startup parameters:
+The connector can query Google Cloud Managed Service for Prometheus through the
+Prometheus HTTP API. Use `--query.gcp-project` for Google projects. The flag
+can be repeated or comma-separated.
+
+For each project, the connector derives:
+
+```text
+--query.target-url=https://monitoring.googleapis.com/v1/projects/<PROJECT_ID>/location/global/prometheus
+--query.external-label=prometheus=gcp-<PROJECT_ID>
+```
+
+Example:
 
 ```bash
 go run -tags slicelabels . \
-    --query.target-url=https://monitoring.googleapis.com/v1/projects/<PROJECT_ID>/location/global/prometheus \
+    --query.gcp-project=itk8s-208609 \
+    --query.gcp-project=space-prod
+```
+
+When `--query.gcp-project` is set, the connector enables Google Application
+Default Credentials automatically. The Google auth library detects credentials
+from `GOOGLE_APPLICATION_CREDENTIALS`, local gcloud ADC, or the metadata server
+such as GKE Workload Identity. If no scope is set, the connector uses the
+read-only Cloud Monitoring scope:
+
+```bash
+https://www.googleapis.com/auth/monitoring.read
+```
+
+You can override scopes, or still provide a credentials file explicitly:
+
+```bash
+go run -tags slicelabels . \
+    --query.gcp-project=<PROJECT_ID> \
+    --query.auth.scope=https://www.googleapis.com/auth/cloud-platform
+
+go run -tags slicelabels . \
+    --query.gcp-project=<PROJECT_ID> \
     --query.auth.credentials-file=/key.json \
     --query.auth.scope=https://www.googleapis.com/auth/monitoring.read
 ```
+
+Do not combine `--query.gcp-project` with `--query.target-url`,
+`--query.external-label=prometheus=...`, `--query.external-labels`, or
+`--query.announce-label`; those values are derived per project in Google mode.
+
+In multi-project mode, Thanos `Info` advertises one label set per project.
+Queries without a `prometheus` matcher fan out to all configured projects.
+Queries with `prometheus="gcp-<PROJECT_ID>"` are routed only to that project,
+and the connector strips the virtual matcher before calling Google. Grafana
+variable requests for `/api/v1/label/prometheus/values`, including requests with
+`match[]`, return the configured `gcp-<PROJECT_ID>` values directly.
+Variable requests for other labels are sent to the selected Google backend, with
+the virtual `prometheus` matcher removed and the remaining `match[]` selectors
+preserved.
+
+The Kubernetes service account used by the connector pod must be able to obtain
+Google credentials and must have read access to the scoping project, for example
+`roles/monitoring.viewer`.
+
+## Static External Labels
+
+Use `--query.external-label=Name=Value` when the connector should own a virtual
+external label that the backend does not physically store. The flag can be
+repeated. Static external labels are advertised in Thanos `Info`, attached to
+all gRPC StoreAPI and QueryAPI results.
+
+For Google Managed Service for Prometheus, prefer `--query.gcp-project`; it
+derives the `prometheus=gcp-<PROJECT_ID>` label per project.
+
+The label participates in routing. StoreAPI label matchers for matching static
+external labels are removed before the backend request. QueryAPI PromQL requests
+also strip matching virtual label matchers before forwarding to Google, so this
+query:
+
+```promql
+up{prometheus="gcp-<PROJECT_ID>"}
+```
+
+is sent to Google as:
+
+```promql
+up
+```
+
+and the connector adds `prometheus="gcp-<PROJECT_ID>"` to the returned series.
+If a query asks for a different value, the connector returns no series for that
+endpoint. Static external labels override backend labels with the same name in
+connector responses.
+
+When Thanos or Grafana asks for values of a static external label, for example
+`/api/v1/label/prometheus/values` with a `match[]` selector, the connector
+returns the configured static value after checking only external-label matchers.
+It does not ask the backend to discover values for labels that only exist after
+connector-side injection.
 
 ## StoreAPI Series
 
