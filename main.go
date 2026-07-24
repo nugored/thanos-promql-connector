@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	authcredentials "cloud.google.com/go/auth/credentials"
+	authhttptransport "cloud.google.com/go/auth/httptransport"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
@@ -27,15 +29,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/thanos-io/promql-engine/logicalplan"
 	"github.com/thanos-io/thanos/pkg/api/query/querypb"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
-	"google.golang.org/api/option"
-	apihttp "google.golang.org/api/transport/http"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -48,8 +50,11 @@ var (
 	queryParams         queryParamFlags
 	queryAuthScopes     stringListFlag
 	queryDropLabels     stringListFlag
+	queryExternalLabel  labelFlags
+	queryGCPProjects    stringListFlag
 	queryAnnounceLabels stringListFlag
 
+	queryAuthGoogle             = flag.Bool("query.auth.google", false, "Enable Google Application Default Credentials for backend requests. Uses credentials from GOOGLE_APPLICATION_CREDENTIALS, gcloud ADC, or the metadata server such as GKE Workload Identity.")
 	queryAuthCredentialsFile    = flag.String("query.auth.credentials-file", "", "Google auth credentials file for backend requests.")
 	queryExternalLabels         = flag.Bool("query.external-labels", false, "Read and apply global.external_labels from the backend /api/v1/status/config endpoint, matching Thanos sidecar behavior.")
 	queryExternalLabelsURL      = flag.String("query.external-labels-url", "", "Prometheus-compatible base URL for reading external labels. Defaults to query.target-url when query.external-labels is enabled.")
@@ -83,11 +88,15 @@ var (
 		"Address on which to expose metrics")
 )
 
+const googleMonitoringReadScope = "https://www.googleapis.com/auth/monitoring.read"
+
 func init() {
 	flag.Var(&queryHeaders, "query.header", "Static header to add to backend requests, in Name=Value or Name: Value format. May be repeated.")
 	flag.Var(&queryParams, "query.param", "Static query parameter to add to every backend Prometheus API request, in Name=Value format. May be repeated.")
 	flag.Var(&queryAuthScopes, "query.auth.scope", "Google auth OAuth scope for backend requests. May be repeated or comma-separated.")
 	flag.Var(&queryDropLabels, "query.drop-label", "Label to remove from query and StoreAPI responses. May be repeated or comma-separated.")
+	flag.Var(&queryExternalLabel, "query.external-label", "Static external label to announce and attach to every response, in Name=Value format. May be repeated.")
+	flag.Var(&queryGCPProjects, "query.gcp-project", "Google Cloud project ID to query through Managed Service for Prometheus. Derives query.target-url and prometheus=gcp-<project> external label. May be repeated or comma-separated.")
 	flag.Var(&queryAnnounceLabels, "query.announce-label", "Backend label whose values should be advertised as StoreAPI Info label sets. May be repeated or comma-separated.")
 }
 
@@ -101,9 +110,15 @@ type queryBackendAPI interface {
 }
 
 type queryServer struct {
-	queryBackendClient queryBackendAPI
-	dropLabels         labelDropSet
-	externalLabels     func() labels.Labels
+	backends   []queryBackendEndpoint
+	dropLabels labelDropSet
+}
+
+type queryBackendEndpoint struct {
+	name           string
+	queryBackend   string
+	client         queryBackendAPI
+	externalLabels func() labels.Labels
 }
 
 type infoAPIMode string
@@ -150,72 +165,119 @@ func (mode infoAPIMode) advertisesQueryAPI() bool {
 }
 
 func newQueryServer(queryBackendClient queryBackendAPI, dropLabels []string, externalLabels func() labels.Labels) *queryServer {
-	if externalLabels == nil {
-		externalLabels = labels.EmptyLabels
+	return newQueryServerFromBackends([]queryBackendEndpoint{{
+		name:           "backend",
+		client:         queryBackendClient,
+		externalLabels: externalLabels,
+	}}, dropLabels)
+}
+
+func newQueryServerFromBackends(backends []queryBackendEndpoint, dropLabels []string) *queryServer {
+	normalized := make([]queryBackendEndpoint, 0, len(backends))
+	for _, backend := range backends {
+		if backend.externalLabels == nil {
+			backend.externalLabels = labels.EmptyLabels
+		}
+		normalized = append(normalized, backend)
 	}
+	if len(normalized) == 0 {
+		normalized = append(normalized, queryBackendEndpoint{
+			name:           "backend",
+			externalLabels: labels.EmptyLabels,
+		})
+	}
+
 	return &queryServer{
-		queryBackendClient: queryBackendClient,
-		dropLabels:         newLabelDropSet(dropLabels),
-		externalLabels:     externalLabels,
+		backends:   normalized,
+		dropLabels: newLabelDropSet(dropLabels),
 	}
 }
 
-func (qs *queryServer) Series(request *storepb.SeriesRequest, server storepb.Store_SeriesServer) error {
-	externalLabels := qs.externalLabels()
-	match, matchers, err := matchesExternalLabels(request.Matchers, externalLabels)
-	if err != nil {
-		return status.Error(codes.InvalidArgument, err.Error())
+func staticExternalLabelsFunc(value labels.Labels) func() labels.Labels {
+	value = value.Copy()
+	return func() labels.Labels {
+		return value.Copy()
 	}
-	if !match {
-		return nil
-	}
-	if len(matchers) == 0 {
-		return status.Error(codes.InvalidArgument, "no matchers specified (excluding external labels)")
-	}
-	selector := querySelectorFromPromMatchers(matchers)
+}
 
+func (backend queryBackendEndpoint) labels() labels.Labels {
+	if backend.externalLabels == nil {
+		return labels.EmptyLabels()
+	}
+	return backend.externalLabels()
+}
+
+func (qs *queryServer) Series(request *storepb.SeriesRequest, server storepb.Store_SeriesServer) error {
 	start := timeFromMillis(request.MinTime)
 	end := timeFromMillis(request.MaxTime)
 	if end.Before(start) {
 		return status.Error(codes.InvalidArgument, "max_time must be greater than or equal to min_time")
 	}
 
-	if request.SkipChunks {
-		return qs.sendSeriesMetadata(request, server, selector, start, end)
-	}
-
-	interval := v1.Range{
-		Start: start,
-		End:   end,
-		Step:  seriesStepForRange(request, *querySeriesStep, start, end, *queryMaxPointsPerSeries),
-	}
-	values, warnings, err := qs.queryBackendClient.QueryRange(server.Context(), selector, interval)
-	if err != nil {
-		return status.Error(codes.Aborted, err.Error())
-	}
-	if err := sendStoreWarnings(server, warnings); err != nil {
-		return err
-	}
-
-	matrix, ok := values.(model.Matrix)
-	if !ok {
-		return status.Errorf(codes.Internal, "backend returned %T for series selector %q, want model.Matrix", values, selector)
-	}
-
+	matched := false
 	var sent int64
-	seriesSet := make([]storepb.Series, 0, len(matrix))
-	for _, result := range matrix {
-		if result == nil || len(result.Values) == 0 {
+	seriesSet := make([]storepb.Series, 0)
+	for _, backend := range qs.backends {
+		externalLabels := backend.labels()
+		match, matchers, err := matchesExternalLabels(request.Matchers, externalLabels)
+		if err != nil {
+			return status.Error(codes.InvalidArgument, err.Error())
+		}
+		if !match {
 			continue
 		}
-		chunks, err := chunksFromModelSamples(result.Values)
-		if err != nil {
-			return status.Error(codes.Internal, err.Error())
+		matched = true
+		if len(matchers) == 0 {
+			return status.Error(codes.InvalidArgument, "no matchers specified (excluding external labels)")
 		}
-		seriesSet = append(seriesSet, storepb.Series{
-			Labels: qs.dropLabels.zLabelsFromMetric(result.Metric, externalLabels, request.WithoutReplicaLabels),
-			Chunks: chunks,
-		})
+		selector := querySelectorFromPromMatchers(matchers)
+
+		if request.SkipChunks {
+			backendSeriesSet, warnings, err := qs.seriesMetadataFromBackend(server.Context(), backend, externalLabels, request, selector, start, end)
+			if err != nil {
+				return status.Error(codes.Aborted, err.Error())
+			}
+			if err := sendStoreWarnings(server, warnings); err != nil {
+				return err
+			}
+			seriesSet = append(seriesSet, backendSeriesSet...)
+			continue
+		}
+
+		interval := v1.Range{
+			Start: start,
+			End:   end,
+			Step:  seriesStepForRange(request, *querySeriesStep, start, end, *queryMaxPointsPerSeries),
+		}
+		values, warnings, err := backend.client.QueryRange(server.Context(), selector, interval)
+		if err != nil {
+			return status.Error(codes.Aborted, err.Error())
+		}
+		if err := sendStoreWarnings(server, warnings); err != nil {
+			return err
+		}
+
+		matrix, ok := values.(model.Matrix)
+		if !ok {
+			return status.Errorf(codes.Internal, "backend returned %T for series selector %q, want model.Matrix", values, selector)
+		}
+
+		for _, result := range matrix {
+			if result == nil || len(result.Values) == 0 {
+				continue
+			}
+			chunks, err := chunksFromModelSamples(result.Values)
+			if err != nil {
+				return status.Error(codes.Internal, err.Error())
+			}
+			seriesSet = append(seriesSet, storepb.Series{
+				Labels: qs.dropLabels.zLabelsFromMetric(result.Metric, externalLabels, request.WithoutReplicaLabels),
+				Chunks: chunks,
+			})
+		}
+	}
+	if !matched {
+		return nil
 	}
 	sortStoreSeries(seriesSet)
 
@@ -231,22 +293,53 @@ func (qs *queryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 	return nil
 }
 
+func (qs *queryServer) seriesMetadataFromBackend(ctx context.Context, backend queryBackendEndpoint, externalLabels labels.Labels, request *storepb.SeriesRequest, selector string, start, end time.Time) ([]storepb.Series, v1.Warnings, error) {
+	labelSets, warnings, err := backend.client.Series(ctx, []string{selector}, start, end)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	seriesSet := make([]storepb.Series, 0, len(labelSets))
+	for _, labelSet := range labelSets {
+		seriesSet = append(seriesSet, storepb.Series{
+			Labels: qs.dropLabels.zLabelsFromLabelSet(labelSet, externalLabels, request.WithoutReplicaLabels),
+		})
+	}
+	return seriesSet, warnings, nil
+}
+
 func (qs *queryServer) LabelNames(ctx context.Context, request *storepb.LabelNamesRequest) (*storepb.LabelNamesResponse, error) {
-	externalLabels := qs.externalLabels()
-	match, promMatchers, err := matchesExternalLabels(request.Matchers, externalLabels)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+	nameSet := make(map[string]struct{})
+	var warnings v1.Warnings
+
+	for _, backend := range qs.backends {
+		externalLabels := backend.labels()
+		match, promMatchers, err := matchesExternalLabels(request.Matchers, externalLabels)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		if !match {
+			continue
+		}
+
+		matches := labelAPISelectorsFromPromMatchers(promMatchers)
+		names, backendWarnings, err := backend.client.LabelNames(ctx, matches, timeFromMillis(request.Start), timeFromMillis(request.End))
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		warnings = append(warnings, backendWarnings...)
+		for _, name := range qs.dropLabels.labelNames(names, externalLabels, request.WithoutReplicaLabels) {
+			nameSet[name] = struct{}{}
+		}
 	}
-	if !match {
-		return &storepb.LabelNamesResponse{}, nil
+
+	names := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		names = append(names, name)
 	}
-	matches := labelAPISelectorsFromPromMatchers(promMatchers)
-	req, warnings, err := qs.queryBackendClient.LabelNames(ctx, matches, timeFromMillis(request.Start), timeFromMillis(request.End))
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
+	sort.Strings(names)
 	return &storepb.LabelNamesResponse{
-		Names:    qs.dropLabels.labelNames(req, externalLabels, request.WithoutReplicaLabels),
+		Names:    names,
 		Warnings: warnings,
 		Hints:    nil,
 	}, nil
@@ -260,38 +353,42 @@ func (qs *queryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 		return &storepb.LabelValuesResponse{}, nil
 	}
 
-	externalLabels := qs.externalLabels()
-	match, promMatchers, err := matchesExternalLabels(request.Matchers, externalLabels)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-	if !match {
-		return &storepb.LabelValuesResponse{}, nil
-	}
-	matches := labelAPISelectorsFromPromMatchers(promMatchers)
+	valueSet := make(map[string]struct{})
+	var warnings v1.Warnings
 
-	if value := externalLabels.Get(request.Label); value != "" {
-		if len(promMatchers) == 0 {
-			return &storepb.LabelValuesResponse{Values: []string{value}}, nil
+	for _, backend := range qs.backends {
+		externalLabels := backend.labels()
+		match, promMatchers, err := matchesExternalLabels(request.Matchers, externalLabels)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
-		labelSets, warnings, err := qs.queryBackendClient.Series(ctx, matches, timeFromMillis(request.Start), timeFromMillis(request.End))
+		if !match {
+			continue
+		}
+
+		// Connector-owned labels are served directly. Every other label value
+		// request goes to the backend with connector-owned matchers stripped.
+		if value := externalLabels.Get(request.Label); value != "" {
+			valueSet[value] = struct{}{}
+			continue
+		}
+
+		matches := labelAPISelectorsFromPromMatchers(promMatchers)
+		req, backendWarnings, err := backend.client.LabelValues(ctx, request.Label, matches, timeFromMillis(request.Start), timeFromMillis(request.End))
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
-		if len(labelSets) == 0 {
-			return &storepb.LabelValuesResponse{Warnings: warnings}, nil
+		warnings = append(warnings, backendWarnings...)
+		for _, value := range req {
+			valueSet[string(value)] = struct{}{}
 		}
-		return &storepb.LabelValuesResponse{Values: []string{value}, Warnings: warnings}, nil
 	}
 
-	req, warnings, err := qs.queryBackendClient.LabelValues(ctx, request.Label, matches, timeFromMillis(request.Start), timeFromMillis(request.End))
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	values := make([]string, 0, len(valueSet))
+	for value := range valueSet {
+		values = append(values, value)
 	}
-	values := make([]string, 0, len(req))
-	for _, value := range req {
-		values = append(values, string(value))
-	}
+	sort.Strings(values)
 	return &storepb.LabelValuesResponse{
 		Values:   values,
 		Warnings: warnings,
@@ -302,39 +399,57 @@ func (qs *queryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 func (qs *queryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryServer) error {
 	ts := time.Unix(req.TimeSeconds, 0)
 	timeout := time.Duration(req.TimeoutSeconds) * time.Second
-	values, warnings, err := qs.queryBackendClient.Query(srv.Context(), req.Query, ts, v1.WithTimeout(timeout))
+	rawQuery, err := queryStringFromRequestPlan(req.Query, req.QueryPlan)
 	if err != nil {
-		return status.Error(codes.Aborted, err.Error())
+		return status.Error(codes.InvalidArgument, err.Error())
 	}
-	if len(warnings) > 0 {
-		errs := make([]error, 0, len(warnings))
-		for _, warning := range warnings {
-			errs = append(errs, errors.New(warning))
+
+	for _, backend := range qs.backends {
+		externalLabels := backend.labels()
+		query, match, err := rewriteQueryForExternalLabels(rawQuery, externalLabels)
+		if err != nil {
+			return status.Error(codes.InvalidArgument, err.Error())
 		}
-		if err = srv.SendMsg(querypb.NewQueryWarningsResponse(errs...)); err != nil {
-			return err
+		if !match {
+			continue
 		}
-	}
-	switch results := values.(type) {
-	case model.Vector:
-		for _, result := range results {
-			if result == nil {
+
+		values, warnings, err := backend.client.Query(srv.Context(), query, ts, v1.WithTimeout(timeout))
+		if err != nil {
+			return status.Error(codes.Aborted, err.Error())
+		}
+		if len(warnings) > 0 {
+			errs := make([]error, 0, len(warnings))
+			for _, warning := range warnings {
+				errs = append(errs, errors.New(warning))
+			}
+			if err = srv.SendMsg(querypb.NewQueryWarningsResponse(errs...)); err != nil {
+				return err
+			}
+		}
+		switch results := values.(type) {
+		case model.Vector:
+			for _, result := range results {
+				if result == nil {
+					continue
+				}
+				series := &prompb.TimeSeries{
+					Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
+					Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, externalLabels, nil),
+				}
+				if err := srv.Send(querypb.NewQueryResponse(series)); err != nil {
+					return err
+				}
+			}
+		case *model.Scalar:
+			if results == nil {
 				continue
 			}
-			series := &prompb.TimeSeries{
-				Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
-				Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, qs.externalLabels(), nil),
-			}
+			series := &prompb.TimeSeries{Samples: []prompb.Sample{{Value: float64(results.Value), Timestamp: int64(results.Timestamp)}}}
 			if err := srv.Send(querypb.NewQueryResponse(series)); err != nil {
 				return err
 			}
 		}
-	case *model.Scalar:
-		if results == nil {
-			return nil
-		}
-		series := &prompb.TimeSeries{Samples: []prompb.Sample{{Value: float64(results.Value), Timestamp: int64(results.Timestamp)}}}
-		return srv.Send(querypb.NewQueryResponse(series))
 	}
 	return nil
 }
@@ -345,85 +460,129 @@ func (qs *queryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 		Start: time.Unix(req.StartTimeSeconds, 0),
 		End:   time.Unix(req.EndTimeSeconds, 0),
 		Step:  time.Duration(req.IntervalSeconds) * time.Second}
-	values, warnings, err := qs.queryBackendClient.QueryRange(srv.Context(), req.Query, interval, v1.WithTimeout(timeout))
+	rawQuery, err := queryStringFromRequestPlan(req.Query, req.QueryPlan)
 	if err != nil {
-		return status.Error(codes.Aborted, err.Error())
+		return status.Error(codes.InvalidArgument, err.Error())
 	}
-	if len(warnings) > 0 {
-		errs := make([]error, 0, len(warnings))
-		for _, warning := range warnings {
-			errs = append(errs, errors.New(warning))
+
+	for _, backend := range qs.backends {
+		externalLabels := backend.labels()
+		query, match, err := rewriteQueryForExternalLabels(rawQuery, externalLabels)
+		if err != nil {
+			return status.Error(codes.InvalidArgument, err.Error())
 		}
-		if err = srv.SendMsg(querypb.NewQueryRangeWarningsResponse(errs...)); err != nil {
-			return err
+		if !match {
+			continue
 		}
-	}
-	switch results := values.(type) {
-	case model.Matrix:
-		for _, result := range results {
-			if result == nil || len(result.Values) == 0 {
+
+		values, warnings, err := backend.client.QueryRange(srv.Context(), query, interval, v1.WithTimeout(timeout))
+		if err != nil {
+			return status.Error(codes.Aborted, err.Error())
+		}
+		if len(warnings) > 0 {
+			errs := make([]error, 0, len(warnings))
+			for _, warning := range warnings {
+				errs = append(errs, errors.New(warning))
+			}
+			if err = srv.SendMsg(querypb.NewQueryRangeWarningsResponse(errs...)); err != nil {
+				return err
+			}
+		}
+		switch results := values.(type) {
+		case model.Matrix:
+			for _, result := range results {
+				if result == nil || len(result.Values) == 0 {
+					continue
+				}
+				series := &prompb.TimeSeries{
+					Samples: samplesFromModel(result.Values),
+					Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, externalLabels, nil),
+				}
+				if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
+					return err
+				}
+			}
+		case model.Vector:
+			for _, result := range results {
+				if result == nil {
+					continue
+				}
+				series := &prompb.TimeSeries{
+					Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
+					Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, externalLabels, nil),
+				}
+				if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
+					return err
+				}
+			}
+		case *model.Scalar:
+			if results == nil {
 				continue
 			}
-			series := &prompb.TimeSeries{
-				Samples: samplesFromModel(result.Values),
-				Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, qs.externalLabels(), nil),
-			}
+			series := &prompb.TimeSeries{Samples: []prompb.Sample{{Value: float64(results.Value), Timestamp: int64(results.Timestamp)}}}
 			if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
 				return err
 			}
 		}
-	case model.Vector:
-		for _, result := range results {
-			if result == nil {
-				continue
-			}
-			series := &prompb.TimeSeries{
-				Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
-				Labels:  qs.dropLabels.zLabelsFromMetric(result.Metric, qs.externalLabels(), nil),
-			}
-			if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
-				return err
-			}
-		}
-	case *model.Scalar:
-		if results == nil {
-			return nil
-		}
-		series := &prompb.TimeSeries{Samples: []prompb.Sample{{Value: float64(results.Value), Timestamp: int64(results.Timestamp)}}}
-		return srv.Send(querypb.NewQueryRangeResponse(series))
 	}
 	return nil
 }
 
-func (qs *queryServer) sendSeriesMetadata(request *storepb.SeriesRequest, server storepb.Store_SeriesServer, selector string, start, end time.Time) error {
-	externalLabels := qs.externalLabels()
-	labelSets, warnings, err := qs.queryBackendClient.Series(server.Context(), []string{selector}, start, end)
+func queryStringFromRequestPlan(query string, plan *querypb.QueryPlan) (string, error) {
+	if plan == nil {
+		return query, nil
+	}
+
+	jsonPlan := plan.GetJson()
+	if len(jsonPlan) == 0 {
+		return "", fmt.Errorf("query plan has no JSON payload")
+	}
+
+	node, err := logicalplan.Unmarshal(jsonPlan)
 	if err != nil {
-		return status.Error(codes.Aborted, err.Error())
+		return "", fmt.Errorf("decode query plan: %w", err)
 	}
-	if err := sendStoreWarnings(server, warnings); err != nil {
-		return err
+	if node == nil {
+		return "", fmt.Errorf("query plan contains unsupported logical node")
 	}
 
-	var sent int64
-	seriesSet := make([]storepb.Series, 0, len(labelSets))
-	for _, labelSet := range labelSets {
-		seriesSet = append(seriesSet, storepb.Series{
-			Labels: qs.dropLabels.zLabelsFromLabelSet(labelSet, externalLabels, request.WithoutReplicaLabels),
-		})
+	node = mergeQueryPlanSelectorFilters(node)
+	plannedQuery := strings.TrimSpace(node.String())
+	if plannedQuery == "" {
+		return "", fmt.Errorf("query plan rendered an empty query")
 	}
-	sortStoreSeries(seriesSet)
+	if _, err := parser.ParseExpr(plannedQuery); err != nil {
+		return "", fmt.Errorf("query plan rendered invalid PromQL %q: %w", plannedQuery, err)
+	}
+	return plannedQuery, nil
+}
 
-	for i := range seriesSet {
-		if err := server.Send(storepb.NewSeriesResponse(&seriesSet[i])); err != nil {
-			return err
+func mergeQueryPlanSelectorFilters(node logicalplan.Node) logicalplan.Node {
+	clone := node.Clone()
+	logicalplan.Traverse(&clone, func(current *logicalplan.Node) {
+		selector, ok := (*current).(*logicalplan.VectorSelector)
+		if !ok || len(selector.Filters) == 0 {
+			return
 		}
-		sent++
-		if request.Limit > 0 && sent >= request.Limit {
-			return nil
+
+		for _, filter := range selector.Filters {
+			if filter == nil || containsMatcher(selector.LabelMatchers, filter) {
+				continue
+			}
+			selector.LabelMatchers = append(selector.LabelMatchers, filter)
+		}
+		selector.Filters = nil
+	})
+	return clone
+}
+
+func containsMatcher(matchers []*labels.Matcher, matcher *labels.Matcher) bool {
+	for _, current := range matchers {
+		if current != nil && current.Type == matcher.Type && current.Name == matcher.Name && current.Value == matcher.Value {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 // samplesFromModel converts model.SamplePair to prompb.Sample.
@@ -605,6 +764,79 @@ func matchesExternalLabels(matchers []storepb.LabelMatcher, externalLabels label
 		}
 	}
 	return true, filtered, nil
+}
+
+// rewriteQueryForExternalLabels applies StoreAPI-style external label matching
+// to raw PromQL QueryAPI requests.
+func rewriteQueryForExternalLabels(query string, externalLabels labels.Labels) (string, bool, error) {
+	if externalLabels.IsEmpty() || !queryMightContainExternalLabel(query, externalLabels) {
+		return query, true, nil
+	}
+
+	expr, err := parser.ParseExpr(query)
+	if err != nil {
+		return "", false, err
+	}
+
+	matches := true
+	changed := false
+	parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+		if !matches {
+			return nil
+		}
+		vectorSelector, ok := node.(*parser.VectorSelector)
+		if !ok {
+			return nil
+		}
+
+		filtered := make([]*labels.Matcher, 0, len(vectorSelector.LabelMatchers))
+		selectorChanged := false
+		for _, matcher := range vectorSelector.LabelMatchers {
+			externalValue := externalLabels.Get(matcher.Name)
+			if externalValue == "" {
+				filtered = append(filtered, matcher)
+				continue
+			}
+			selectorChanged = true
+			if !matcher.Matches(externalValue) {
+				matches = false
+				return nil
+			}
+		}
+		if !selectorChanged {
+			return nil
+		}
+
+		if vectorSelector.Name == "" && len(filtered) == 0 {
+			filtered = append(filtered, labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, ".+"))
+		}
+		vectorSelector.LabelMatchers = filtered
+		changed = true
+		return nil
+	})
+	if !matches {
+		return "", false, nil
+	}
+	if !changed {
+		return query, true, nil
+	}
+	return expr.String(), true, nil
+}
+
+func queryMightContainExternalLabel(query string, externalLabels labels.Labels) bool {
+	query = strings.NewReplacer(" ", "", "\t", "", "\n", "", "\r", "").Replace(query)
+	mightContain := false
+	externalLabels.Range(func(label labels.Label) {
+		if mightContain {
+			return
+		}
+		quotedName := `"` + label.Name + `"`
+		mightContain = strings.Contains(query, label.Name+"=") ||
+			strings.Contains(query, label.Name+"!") ||
+			strings.Contains(query, quotedName+"=") ||
+			strings.Contains(query, quotedName+"!")
+	})
+	return mightContain
 }
 
 func seriesStep(request *storepb.SeriesRequest, fallback time.Duration) time.Duration {
@@ -1047,18 +1279,22 @@ func (info *infoServer) Info(ctx context.Context, in *infopb.InfoRequest) (*info
 	labelSets := labelpb.ZLabelSetsFromPromLabels(labels.FromStrings("query-backend", info.queryBackend))
 	tsdbInfos := []infopb.TSDBInfo{{MinTime: math.MinInt64, MaxTime: math.MaxInt64}}
 	usingFallbackLabelSet := true
+	externalLabels := labels.EmptyLabels()
+	if info.externalLabels != nil {
+		externalLabels = info.externalLabels()
+	}
 
 	if info.announcedLabelSets != nil {
 		announcedLabelSets := info.announcedLabelSets()
 		if len(announcedLabelSets) > 0 {
+			announcedLabelSets = extendLabelSets(announcedLabelSets, externalLabels)
 			labelSets = labelpb.ZLabelSetsFromPromLabels(announcedLabelSets...)
 			tsdbInfos = tsdbInfosFromLabelSets(labelSets)
 			usingFallbackLabelSet = false
 		}
 	}
 
-	if usingFallbackLabelSet && info.externalLabels != nil {
-		externalLabels := info.externalLabels()
+	if usingFallbackLabelSet {
 		if externalLabels.Len() > 0 {
 			labelSets = labelpb.ZLabelSetsFromPromLabels(externalLabels)
 			tsdbInfos = tsdbInfosFromLabelSets(labelSets)
@@ -1088,6 +1324,22 @@ func (info *infoServer) Info(ctx context.Context, in *infopb.InfoRequest) (*info
 		Store:         storeInfo,
 		Query:         queryInfo,
 	}, nil
+}
+
+func extendLabelSets(labelSets []labels.Labels, externalLabels labels.Labels) []labels.Labels {
+	if externalLabels.IsEmpty() {
+		result := make([]labels.Labels, 0, len(labelSets))
+		for _, labelSet := range labelSets {
+			result = append(result, labelSet.Copy())
+		}
+		return result
+	}
+
+	result := make([]labels.Labels, 0, len(labelSets))
+	for _, labelSet := range labelSets {
+		result = append(result, labelpb.ExtendSortedLabels(labelSet, externalLabels))
+	}
+	return result
 }
 
 func tsdbInfosFromLabelSets(labelSets []labelpb.ZLabelSet) []infopb.TSDBInfo {
@@ -1141,26 +1393,74 @@ func (rt *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 func newQueryBackendRoundTripper(queryConfig queryBackendConfig) (http.RoundTripper, error) {
 	transport := http.RoundTripper(http.DefaultTransport)
 	if queryAuthEnabled(queryConfig.Auth) {
-		opts := make([]option.ClientOption, 0, 2)
-		if len(queryConfig.Auth.Scopes) > 0 {
-			opts = append(opts, option.WithScopes(queryConfig.Auth.Scopes...))
-		}
-		if queryConfig.Auth.CredentialsFile != "" {
-			opts = append(opts, option.WithCredentialsFile(queryConfig.Auth.CredentialsFile))
-		}
-
-		var err error
-		transport, err = apihttp.NewTransport(context.Background(), transport, opts...)
+		client, err := authhttptransport.NewClient(&authhttptransport.Options{
+			BaseRoundTripper: transport,
+			DetectOpts: &authcredentials.DetectOptions{
+				CredentialsFile: queryConfig.Auth.CredentialsFile,
+				Scopes:          googleAuthScopes(queryConfig.Auth),
+			},
+		})
 		if err != nil {
-			return nil, fmt.Errorf("error creating proxy HTTP transport: %s", err)
+			return nil, fmt.Errorf("error creating Google auth HTTP transport: %w", err)
 		}
+		transport = client.Transport
 	}
 
 	return newHeaderRoundTripper(transport, queryConfig.Headers), nil
 }
 
 func queryAuthEnabled(auth queryBackendAuthConfig) bool {
-	return auth.CredentialsFile != "" || len(auth.Scopes) > 0
+	return auth.Google || auth.CredentialsFile != "" || len(auth.Scopes) > 0
+}
+
+func googleAuthScopes(auth queryBackendAuthConfig) []string {
+	if len(auth.Scopes) > 0 {
+		return auth.Scopes
+	}
+	if auth.Google {
+		return []string{googleMonitoringReadScope}
+	}
+	return nil
+}
+
+func newGCPQueryBackends(baseConfig queryBackendConfig, projects []string, staticExternalLabels labels.Labels) ([]queryBackendEndpoint, error) {
+	backends := make([]queryBackendEndpoint, 0, len(projects))
+	for _, project := range projects {
+		targetURL, err := googlePrometheusTargetURL(project)
+		if err != nil {
+			return nil, err
+		}
+
+		backendConfig := baseConfig
+		backendConfig.QueryTargetURL = targetURL
+		backendConfig.Auth.Google = true
+
+		client, err := createQueryBackendClient(backendConfig)
+		if err != nil {
+			return nil, fmt.Errorf("create Google project backend %q: %w", project, err)
+		}
+
+		projectLabels := labelpb.ExtendSortedLabels(staticExternalLabels, labels.FromStrings("prometheus", "gcp-"+project))
+		backends = append(backends, queryBackendEndpoint{
+			name:           project,
+			queryBackend:   targetURL,
+			client:         client,
+			externalLabels: staticExternalLabelsFunc(projectLabels),
+		})
+	}
+	return backends, nil
+}
+
+func queryBackendLabelSets(backends []queryBackendEndpoint) []labels.Labels {
+	labelSets := make([]labels.Labels, 0, len(backends))
+	for _, backend := range backends {
+		externalLabels := backend.labels()
+		if externalLabels.IsEmpty() {
+			continue
+		}
+		labelSets = append(labelSets, externalLabels)
+	}
+	return labelSets
 }
 
 // createQueryBackendClient creates a connection with the backend that the queries will be forwarded to.
@@ -1181,6 +1481,20 @@ func createQueryBackendClient(queryConfig queryBackendConfig) (queryBackendAPI, 
 		return nil, fmt.Errorf("error creating client: %s", err)
 	}
 	return v1.NewAPI(client), nil
+}
+
+func newWebHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/-/healthy", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+	})
+	mux.HandleFunc("/-/ready", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+	})
+	return mux
 }
 
 type grpcServerTLSConfig struct {
@@ -1236,33 +1550,99 @@ func main() {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
 	}
+
+	gcpProjects, err := normalizeGCPProjects(queryGCPProjects.values())
+	if err != nil {
+		level.Error(logger).Log("err", err)
+		os.Exit(1)
+	}
+	staticExternalLabels := labels.FromMap(queryExternalLabel.values())
+	announcedLabelNames := queryAnnounceLabels.values()
+
 	// Configuration Loading.
-	queryConfig, err := newQueryBackendConfig(*queryTargetURL, queryHeaders.values(), queryParams.values(), *queryAuthCredentialsFile, queryAuthScopes.values())
+	queryTargetURLValue := *queryTargetURL
+	googleAuth := *queryAuthGoogle
+	if len(gcpProjects) > 0 {
+		if strings.TrimSpace(*queryTargetURL) != "" {
+			level.Error(logger).Log("msg", "query.target-url cannot be used with query.gcp-project because the Google target URL is derived per project")
+			os.Exit(1)
+		}
+		if *queryExternalLabels {
+			level.Error(logger).Log("msg", "query.external-labels cannot be used with query.gcp-project because external labels are derived per project")
+			os.Exit(1)
+		}
+		if strings.TrimSpace(*queryExternalLabelsURL) != "" {
+			level.Error(logger).Log("msg", "query.external-labels-url cannot be used with query.gcp-project")
+			os.Exit(1)
+		}
+		if len(announcedLabelNames) > 0 {
+			level.Error(logger).Log("msg", "query.announce-label cannot be used with query.gcp-project because announced label sets are derived per project")
+			os.Exit(1)
+		}
+		if staticExternalLabels.Get("prometheus") != "" {
+			level.Error(logger).Log("msg", "query.external-label=prometheus=... cannot be used with query.gcp-project because prometheus=gcp-<project> is derived per project")
+			os.Exit(1)
+		}
+		queryTargetURLValue, err = googlePrometheusTargetURL(gcpProjects[0])
+		if err != nil {
+			level.Error(logger).Log("err", err)
+			os.Exit(1)
+		}
+		googleAuth = true
+	}
+
+	queryConfig, err := newQueryBackendConfig(queryTargetURLValue, queryHeaders.values(), queryParams.values(), googleAuth, *queryAuthCredentialsFile, queryAuthScopes.values())
 	if err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
 	}
 	// Query client setup.
-	queryBackendClient, err := createQueryBackendClient(*queryConfig)
-	if err != nil {
-		level.Error(logger).Log("msg", "Error creating client", "err", err)
-		os.Exit(1)
-	}
 	externalLabels := newExternalLabelsStore()
-	announcedLabelSets := newAnnouncedLabelSetsStore()
-	announcedLabelNames := queryAnnounceLabels.values()
-	var announcedLabelSources []announcedLabelSource
+	externalLabelsForRequests := func() labels.Labels {
+		return labelpb.ExtendSortedLabels(externalLabels.Labels(), staticExternalLabels)
+	}
+	if staticExternalLabels.Len() > 0 {
+		level.Info(logger).Log("msg", "configured static external labels", "external_labels", staticExternalLabels.String())
+	}
 
-	externalLabelsClient := queryBackendClient
-	if *queryExternalLabelsURL != "" {
-		externalLabelsConfig := *queryConfig
-		externalLabelsConfig.QueryTargetURL = *queryExternalLabelsURL
-		externalLabelsClient, err = createQueryBackendClient(externalLabelsConfig)
+	var queryBackends []queryBackendEndpoint
+	var queryBackendClient queryBackendAPI
+	var externalLabelsClient queryBackendAPI
+	if len(gcpProjects) > 0 {
+		queryBackends, err = newGCPQueryBackends(*queryConfig, gcpProjects, staticExternalLabels)
 		if err != nil {
-			level.Error(logger).Log("msg", "Error creating external labels client", "err", err)
+			level.Error(logger).Log("msg", "Error creating Google project clients", "err", err)
 			os.Exit(1)
 		}
+		level.Info(logger).Log("msg", "configured Google Managed Service for Prometheus projects", "projects", strings.Join(gcpProjects, ","), "auth_google", queryConfig.Auth.Google)
+	} else {
+		queryBackendClient, err = createQueryBackendClient(*queryConfig)
+		if err != nil {
+			level.Error(logger).Log("msg", "Error creating client", "err", err)
+			os.Exit(1)
+		}
+		queryBackends = []queryBackendEndpoint{{
+			name:           "backend",
+			queryBackend:   queryConfig.QueryTargetURL,
+			client:         queryBackendClient,
+			externalLabels: externalLabelsForRequests,
+		}}
+
+		externalLabelsClient = queryBackendClient
+		if *queryExternalLabelsURL != "" {
+			externalLabelsConfig := *queryConfig
+			externalLabelsConfig.QueryTargetURL = *queryExternalLabelsURL
+			externalLabelsClient, err = createQueryBackendClient(externalLabelsConfig)
+			if err != nil {
+				level.Error(logger).Log("msg", "Error creating external labels client", "err", err)
+				os.Exit(1)
+			}
+		}
 	}
+
+	announcedLabelSets := newAnnouncedLabelSetsStore()
+	var announcedLabelSources []announcedLabelSource
+
 	if *queryExternalLabels {
 		ctx, cancel := context.WithTimeout(context.Background(), *queryExternalLabelsTimeout)
 		err = externalLabels.UpdateFromBackend(ctx, externalLabelsClient)
@@ -1308,6 +1688,17 @@ func main() {
 			os.Exit(1)
 		}
 		level.Info(logger).Log("msg", "successfully loaded backend announced label sets", "labels", fmt.Sprint(announcedLabelNames), "sources", fmt.Sprint(announcedLabelSourceNames(announcedLabelSources)), "lookback", queryAnnounceLabelLookback.String(), "label_sets", fmt.Sprint(announcedLabelSets.LabelSets()))
+	}
+
+	queryBackendDescription := queryConfig.QueryTargetURL
+	infoExternalLabels := externalLabelsForRequests
+	infoAnnouncedLabelSets := announcedLabelSets.LabelSets
+	if len(gcpProjects) > 0 {
+		queryBackendDescription = "gcp-projects:" + strings.Join(gcpProjects, ",")
+		infoExternalLabels = labels.EmptyLabels
+		infoAnnouncedLabelSets = func() []labels.Labels {
+			return queryBackendLabelSets(queryBackends)
+		}
 	}
 
 	var g run.Group
@@ -1393,13 +1784,13 @@ func main() {
 			os.Exit(1)
 		}
 		server := grpc.NewServer(serverOptions...)
-		queryServer := newQueryServer(queryBackendClient, queryDropLabels.values(), externalLabels.Labels)
+		queryServer := newQueryServerFromBackends(queryBackends, queryDropLabels.values())
 		storepb.RegisterStoreServer(server, queryServer)
 		querypb.RegisterQueryServer(server, queryServer)
 		infopb.RegisterInfoServer(server, &infoServer{
-			queryBackend:       queryConfig.QueryTargetURL,
-			externalLabels:     externalLabels.Labels,
-			announcedLabelSets: announcedLabelSets.LabelSets,
+			queryBackend:       queryBackendDescription,
+			externalLabels:     infoExternalLabels,
+			announcedLabelSets: infoAnnouncedLabelSets,
 			apiMode:            infoMode,
 		})
 		g.Add(func() error {
@@ -1412,20 +1803,10 @@ func main() {
 	{
 		// http server.
 		ctx, cancel := context.WithCancel(context.Background())
-		server := &http.Server{Addr: *metricsAddress}
-		http.Handle("/metrics", promhttp.Handler())
-
-		http.HandleFunc("/-/healthy", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, "OK")
-		})
-		http.HandleFunc("/-/ready", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, "OK")
-		})
+		server := &http.Server{Addr: *metricsAddress, Handler: newWebHandler()}
 
 		g.Add(func() error {
-			level.Info(logger).Log("msg", "Starting web server for metrics", "listen", *metricsAddress)
+			level.Info(logger).Log("msg", "Starting web server", "listen", *metricsAddress)
 			return server.ListenAndServe()
 		}, func(err error) {
 			server.Shutdown(ctx)

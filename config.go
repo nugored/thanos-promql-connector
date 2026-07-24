@@ -5,6 +5,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+
+	"github.com/prometheus/common/model"
 )
 
 // queryBackendConfig represents the configuration for a backend query target.
@@ -16,6 +18,7 @@ type queryBackendConfig struct {
 }
 
 type queryBackendAuthConfig struct {
+	Google          bool
 	CredentialsFile string
 	Scopes          []string
 }
@@ -104,6 +107,61 @@ func (p queryParamFlags) values() map[string][]string {
 	return cloneQueryParams(p)
 }
 
+type labelFlags map[string]string
+
+func (l *labelFlags) String() string {
+	if l == nil || len(*l) == 0 {
+		return ""
+	}
+
+	pairs := make([]string, 0, len(*l))
+	for name, value := range *l {
+		pairs = append(pairs, fmt.Sprintf("%s=%s", name, value))
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, ",")
+}
+
+func (l *labelFlags) Set(value string) error {
+	equalsIndex := strings.Index(value, "=")
+	if equalsIndex < 0 {
+		return fmt.Errorf("query.external-label must be in Name=Value format")
+	}
+
+	name := strings.TrimSpace(value[:equalsIndex])
+	labelValue := strings.TrimSpace(value[equalsIndex+1:])
+	if name == "" {
+		return fmt.Errorf("query.external-label cannot contain an empty label name")
+	}
+	if !model.LegacyValidation.IsValidLabelName(name) {
+		return fmt.Errorf("query.external-label contains invalid label name %q", name)
+	}
+	if labelValue == "" {
+		return fmt.Errorf("query.external-label cannot contain an empty label value")
+	}
+	if !model.LabelValue(labelValue).IsValid() {
+		return fmt.Errorf("query.external-label contains invalid value for label %q", name)
+	}
+
+	if *l == nil {
+		*l = make(map[string]string)
+	}
+	(*l)[name] = labelValue
+	return nil
+}
+
+func (l labelFlags) values() map[string]string {
+	if len(l) == 0 {
+		return nil
+	}
+
+	result := make(map[string]string, len(l))
+	for name, value := range l {
+		result[name] = value
+	}
+	return result
+}
+
 func splitHeaderFlag(value string) (string, string, bool) {
 	equalsIndex := strings.Index(value, "=")
 	colonIndex := strings.Index(value, ":")
@@ -152,7 +210,36 @@ func (s stringListFlag) values() []string {
 	return result
 }
 
-func newQueryBackendConfig(queryTargetURL string, headers map[string]string, queryParams map[string][]string, credentialsFile string, scopes []string) (*queryBackendConfig, error) {
+func normalizeGCPProjects(projects []string) ([]string, error) {
+	normalized := normalizeStrings(projects)
+	if len(normalized) == 0 {
+		return nil, nil
+	}
+
+	result := make([]string, 0, len(normalized))
+	seen := make(map[string]struct{}, len(normalized))
+	for _, project := range normalized {
+		if _, err := googlePrometheusTargetURL(project); err != nil {
+			return nil, err
+		}
+		if _, ok := seen[project]; ok {
+			continue
+		}
+		seen[project] = struct{}{}
+		result = append(result, project)
+	}
+	return result, nil
+}
+
+func googlePrometheusTargetURL(projectID string) (string, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return "", fmt.Errorf("query.gcp-project cannot contain an empty project ID")
+	}
+	return fmt.Sprintf("https://monitoring.googleapis.com/v1/projects/%s/location/global/prometheus", url.PathEscape(projectID)), nil
+}
+
+func newQueryBackendConfig(queryTargetURL string, headers map[string]string, queryParams map[string][]string, googleAuth bool, credentialsFile string, scopes []string) (*queryBackendConfig, error) {
 	normalizedHeaders, err := normalizeHeaders(headers)
 	if err != nil {
 		return nil, err
@@ -167,6 +254,7 @@ func newQueryBackendConfig(queryTargetURL string, headers map[string]string, que
 		Headers:        normalizedHeaders,
 		QueryParams:    normalizedQueryParams,
 		Auth: queryBackendAuthConfig{
+			Google:          googleAuth,
 			CredentialsFile: strings.TrimSpace(credentialsFile),
 			Scopes:          normalizeStrings(scopes),
 		},
