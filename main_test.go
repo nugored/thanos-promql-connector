@@ -22,6 +22,10 @@ import (
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/thanos-io/promql-engine/logicalplan"
+	promqlquery "github.com/thanos-io/promql-engine/query"
+	"github.com/thanos-io/thanos/pkg/api/query/querypb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"google.golang.org/grpc/encoding"
@@ -660,6 +664,112 @@ func TestSeriesMetadataSortsByFinalLabels(t *testing.T) {
 	}
 }
 
+func TestQueryUsesQueryPlan(t *testing.T) {
+	calls := make([]fakeQueryCall, 0, 1)
+	server := newQueryServer(
+		fakeQueryBackendAPI{
+			queryCalls: &calls,
+			queryValue: model.Vector{
+				&model.Sample{
+					Metric:    model.Metric{"__name__": "up", "job": "api"},
+					Timestamp: 123000,
+					Value:     1,
+				},
+			},
+		},
+		nil,
+		staticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-itk8s-208609")),
+	)
+	stream := &recordingQueryServer{recordingServerStream: recordingServerStream{ctx: context.Background()}}
+
+	err := server.Query(&querypb.QueryRequest{
+		Query:       `up{prometheus="wrong"}`,
+		QueryPlan:   mustQueryPlan(t, `up{prometheus="gcp-itk8s-208609", job="api"}`),
+		TimeSeconds: 123,
+	}, stream)
+	if err != nil {
+		t.Fatalf("Query() returned error: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("len(query calls) = %d, want 1", len(calls))
+	}
+	if got, want := calls[0].query, `up{job="api"}`; got != want {
+		t.Fatalf("backend query = %q, want %q", got, want)
+	}
+	if len(stream.responses) != 1 {
+		t.Fatalf("len(responses) = %d, want 1", len(stream.responses))
+	}
+}
+
+func TestQueryRangeUsesQueryPlan(t *testing.T) {
+	calls := make([]fakeQueryRangeCall, 0, 1)
+	server := newQueryServer(
+		fakeQueryBackendAPI{
+			queryRangeCalls: &calls,
+			queryRangeValue: model.Matrix{
+				&model.SampleStream{
+					Metric: model.Metric{"__name__": "http_requests_total", "job": "api"},
+					Values: []model.SamplePair{
+						{Timestamp: 123000, Value: 1},
+					},
+				},
+			},
+		},
+		nil,
+		staticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-itk8s-208609")),
+	)
+	stream := &recordingQueryRangeServer{recordingServerStream: recordingServerStream{ctx: context.Background()}}
+
+	err := server.QueryRange(&querypb.QueryRangeRequest{
+		Query:            `rate(http_requests_total{prometheus="wrong"}[5m])`,
+		QueryPlan:        mustQueryPlan(t, `rate(http_requests_total{prometheus="gcp-itk8s-208609", job="api"}[5m])`),
+		StartTimeSeconds: 100,
+		EndTimeSeconds:   200,
+		IntervalSeconds:  15,
+	}, stream)
+	if err != nil {
+		t.Fatalf("QueryRange() returned error: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("len(query range calls) = %d, want 1", len(calls))
+	}
+	if got, want := calls[0].query, `rate(http_requests_total{job="api"}[5m])`; got != want {
+		t.Fatalf("backend query = %q, want %q", got, want)
+	}
+	if got, want := calls[0].r.Step, 15*time.Second; got != want {
+		t.Fatalf("backend step = %s, want %s", got, want)
+	}
+	if len(stream.responses) != 1 {
+		t.Fatalf("len(responses) = %d, want 1", len(stream.responses))
+	}
+}
+
+func TestQueryStringFromRequestPlanPreservesSelectorFilters(t *testing.T) {
+	queryPlan, err := querypb.NewJSONEncodedPlan(&logicalplan.VectorSelector{
+		VectorSelector: &parser.VectorSelector{
+			Name: "up",
+			LabelMatchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up"),
+				labels.MustNewMatcher(labels.MatchEqual, "job", "api"),
+			},
+		},
+		Filters: []*labels.Matcher{
+			labels.MustNewMatcher(labels.MatchEqual, "instance", "server-1"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewJSONEncodedPlan() returned error: %v", err)
+	}
+
+	got, err := queryStringFromRequestPlan("", queryPlan)
+	if err != nil {
+		t.Fatalf("queryStringFromRequestPlan() returned error: %v", err)
+	}
+	if !strings.Contains(got, `instance="server-1"`) {
+		t.Fatalf("queryStringFromRequestPlan() = %q, want selector filter preserved", got)
+	}
+}
+
 func TestLabelDropSetFiltersLabelsButKeepsPrometheusLabel(t *testing.T) {
 	dropLabels := newLabelDropSet([]string{"__tenant_id__"})
 
@@ -1264,7 +1374,9 @@ type fakeQueryBackendAPI struct {
 	labelValuesCalls *[]fakeLabelValuesCall
 	seriesLabelSets  []model.LabelSet
 	queryValue       model.Value
+	queryCalls       *[]fakeQueryCall
 	queryRangeValue  model.Value
+	queryRangeCalls  *[]fakeQueryRangeCall
 	err              error
 }
 
@@ -1273,6 +1385,16 @@ type fakeLabelValuesCall struct {
 	matches   []string
 	startTime time.Time
 	endTime   time.Time
+}
+
+type fakeQueryCall struct {
+	query string
+	ts    time.Time
+}
+
+type fakeQueryRangeCall struct {
+	query string
+	r     v1.Range
 }
 
 func (f fakeQueryBackendAPI) Config(ctx context.Context) (v1.ConfigResult, error) {
@@ -1299,6 +1421,12 @@ func (f fakeQueryBackendAPI) LabelValues(ctx context.Context, label string, matc
 }
 
 func (f fakeQueryBackendAPI) Query(ctx context.Context, query string, ts time.Time, opts ...v1.Option) (model.Value, v1.Warnings, error) {
+	if f.queryCalls != nil {
+		*f.queryCalls = append(*f.queryCalls, fakeQueryCall{
+			query: query,
+			ts:    ts,
+		})
+	}
 	if f.err != nil {
 		return nil, nil, f.err
 	}
@@ -1306,6 +1434,12 @@ func (f fakeQueryBackendAPI) Query(ctx context.Context, query string, ts time.Ti
 }
 
 func (f fakeQueryBackendAPI) QueryRange(ctx context.Context, query string, r v1.Range, opts ...v1.Option) (model.Value, v1.Warnings, error) {
+	if f.queryRangeCalls != nil {
+		*f.queryRangeCalls = append(*f.queryRangeCalls, fakeQueryRangeCall{
+			query: query,
+			r:     r,
+		})
+	}
 	if f.err != nil {
 		return nil, nil, f.err
 	}
@@ -1317,6 +1451,83 @@ func (f fakeQueryBackendAPI) Series(ctx context.Context, matches []string, start
 		return nil, nil, f.err
 	}
 	return f.seriesLabelSets, nil, nil
+}
+
+func mustQueryPlan(t *testing.T, query string) *querypb.QueryPlan {
+	t.Helper()
+
+	expr, err := parser.ParseExpr(query)
+	if err != nil {
+		t.Fatalf("ParseExpr(%q) returned error: %v", query, err)
+	}
+	plan, err := logicalplan.NewFromAST(expr, &promqlquery.Options{
+		Start:         time.Unix(100, 0),
+		End:           time.Unix(200, 0),
+		Step:          15 * time.Second,
+		LookbackDelta: 5 * time.Minute,
+		NoStepSubqueryIntervalFn: func(time.Duration) time.Duration {
+			return time.Minute
+		},
+	}, logicalplan.PlanOptions{})
+	if err != nil {
+		t.Fatalf("NewFromAST(%q) returned error: %v", query, err)
+	}
+	queryPlan, err := querypb.NewJSONEncodedPlan(plan.Root())
+	if err != nil {
+		t.Fatalf("NewJSONEncodedPlan(%q) returned error: %v", query, err)
+	}
+	return queryPlan
+}
+
+type recordingServerStream struct {
+	ctx      context.Context
+	messages []any
+}
+
+func (s *recordingServerStream) SetHeader(metadata.MD) error {
+	return nil
+}
+
+func (s *recordingServerStream) SendHeader(metadata.MD) error {
+	return nil
+}
+
+func (s *recordingServerStream) SetTrailer(metadata.MD) {}
+
+func (s *recordingServerStream) Context() context.Context {
+	if s.ctx == nil {
+		return context.Background()
+	}
+	return s.ctx
+}
+
+func (s *recordingServerStream) SendMsg(message any) error {
+	s.messages = append(s.messages, message)
+	return nil
+}
+
+func (s *recordingServerStream) RecvMsg(any) error {
+	return nil
+}
+
+type recordingQueryServer struct {
+	recordingServerStream
+	responses []*querypb.QueryResponse
+}
+
+func (s *recordingQueryServer) Send(response *querypb.QueryResponse) error {
+	s.responses = append(s.responses, response)
+	return nil
+}
+
+type recordingQueryRangeServer struct {
+	recordingServerStream
+	responses []*querypb.QueryRangeResponse
+}
+
+func (s *recordingQueryRangeServer) Send(response *querypb.QueryRangeResponse) error {
+	s.responses = append(s.responses, response)
+	return nil
 }
 
 type recordingStoreSeriesServer struct {
