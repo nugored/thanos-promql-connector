@@ -782,7 +782,7 @@ func TestLabelValuesReadsNonExternalLabelFromSelectedBackend(t *testing.T) {
 	if strings.Contains(call.matches[0], "prometheus") {
 		t.Fatalf("LabelValues() backend selector = %q, want prometheus matcher stripped", call.matches[0])
 	}
-	if !strings.Contains(call.matches[0], `logging_googleapis_com:byte_count`) || !strings.Contains(call.matches[0], `location="global"`) {
+	if !strings.Contains(call.matches[0], `__name__="logging_googleapis_com:byte_count"`) || !strings.Contains(call.matches[0], `location="global"`) {
 		t.Fatalf("LabelValues() backend selector = %q, want non-external matchers kept", call.matches[0])
 	}
 }

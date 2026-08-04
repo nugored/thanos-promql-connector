@@ -34,36 +34,14 @@ func QuerySelectorFromMatchers(matchers []storepb.LabelMatcher) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return QuerySelectorFromPromMatchers(promMatchers), nil
+	return storepb.PromMatchersToString(promMatchers...), nil
 }
 
 func QuerySelectorFromPromMatchers(matchers []*labels.Matcher) string {
 	if len(matchers) == 0 {
 		return `{__name__=~".+"}`
 	}
-
-	var name string
-	filtered := make([]*labels.Matcher, 0, len(matchers))
-	for _, m := range matchers {
-		if m == nil {
-			continue
-		}
-		if m.Name == labels.MetricName && m.Type == labels.MatchEqual {
-			name = m.Value
-		} else {
-			filtered = append(filtered, m)
-		}
-	}
-
-	if name == "" && len(filtered) == 0 {
-		return `{__name__=~".+"}`
-	}
-
-	vs := &parser.VectorSelector{
-		Name:          name,
-		LabelMatchers: filtered,
-	}
-	return vs.String()
+	return storepb.PromMatchersToString(matchers...)
 }
 
 // MatchesExternalLabels follows Thanos sidecar StoreAPI semantics: external
