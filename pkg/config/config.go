@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"fmt"
@@ -9,23 +9,23 @@ import (
 	"github.com/prometheus/common/model"
 )
 
-// queryBackendConfig represents the configuration for a backend query target.
-type queryBackendConfig struct {
+// QueryBackendConfig represents the configuration for a backend query target.
+type QueryBackendConfig struct {
 	QueryTargetURL string
 	Headers        map[string]string
 	QueryParams    map[string][]string
-	Auth           queryBackendAuthConfig
+	Auth           QueryBackendAuthConfig
 }
 
-type queryBackendAuthConfig struct {
+type QueryBackendAuthConfig struct {
 	Google          bool
 	CredentialsFile string
 	Scopes          []string
 }
 
-type headerFlags map[string]string
+type HeaderFlags map[string]string
 
-func (h *headerFlags) String() string {
+func (h *HeaderFlags) String() string {
 	if h == nil || len(*h) == 0 {
 		return ""
 	}
@@ -38,7 +38,7 @@ func (h *headerFlags) String() string {
 	return strings.Join(pairs, ",")
 }
 
-func (h *headerFlags) Set(value string) error {
+func (h *HeaderFlags) Set(value string) error {
 	name, headerValue, ok := splitHeaderFlag(value)
 	if !ok {
 		return fmt.Errorf("query.header must be in Name=Value or Name: Value format")
@@ -56,7 +56,7 @@ func (h *headerFlags) Set(value string) error {
 	return nil
 }
 
-func (h headerFlags) values() map[string]string {
+func (h HeaderFlags) Values() map[string]string {
 	if len(h) == 0 {
 		return nil
 	}
@@ -68,9 +68,9 @@ func (h headerFlags) values() map[string]string {
 	return result
 }
 
-type queryParamFlags map[string][]string
+type QueryParamFlags map[string][]string
 
-func (p *queryParamFlags) String() string {
+func (p *QueryParamFlags) String() string {
 	if p == nil || len(*p) == 0 {
 		return ""
 	}
@@ -85,7 +85,7 @@ func (p *queryParamFlags) String() string {
 	return strings.Join(pairs, ",")
 }
 
-func (p *queryParamFlags) Set(value string) error {
+func (p *QueryParamFlags) Set(value string) error {
 	equalsIndex := strings.Index(value, "=")
 	if equalsIndex < 0 {
 		return fmt.Errorf("query.param must be in Name=Value format")
@@ -103,13 +103,13 @@ func (p *queryParamFlags) Set(value string) error {
 	return nil
 }
 
-func (p queryParamFlags) values() map[string][]string {
+func (p QueryParamFlags) Values() map[string][]string {
 	return cloneQueryParams(p)
 }
 
-type labelFlags map[string]string
+type LabelFlags map[string]string
 
-func (l *labelFlags) String() string {
+func (l *LabelFlags) String() string {
 	if l == nil || len(*l) == 0 {
 		return ""
 	}
@@ -122,7 +122,7 @@ func (l *labelFlags) String() string {
 	return strings.Join(pairs, ",")
 }
 
-func (l *labelFlags) Set(value string) error {
+func (l *LabelFlags) Set(value string) error {
 	equalsIndex := strings.Index(value, "=")
 	if equalsIndex < 0 {
 		return fmt.Errorf("query.external-label must be in Name=Value format")
@@ -150,7 +150,7 @@ func (l *labelFlags) Set(value string) error {
 	return nil
 }
 
-func (l labelFlags) values() map[string]string {
+func (l LabelFlags) Values() map[string]string {
 	if len(l) == 0 {
 		return nil
 	}
@@ -180,16 +180,16 @@ func splitHeaderFlag(value string) (string, string, bool) {
 	}
 }
 
-type stringListFlag []string
+type StringListFlag []string
 
-func (s *stringListFlag) String() string {
+func (s *StringListFlag) String() string {
 	if s == nil {
 		return ""
 	}
 	return strings.Join(*s, ",")
 }
 
-func (s *stringListFlag) Set(value string) error {
+func (s *StringListFlag) Set(value string) error {
 	for _, part := range strings.Split(value, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
@@ -200,7 +200,7 @@ func (s *stringListFlag) Set(value string) error {
 	return nil
 }
 
-func (s stringListFlag) values() []string {
+func (s StringListFlag) Values() []string {
 	if len(s) == 0 {
 		return nil
 	}
@@ -210,8 +210,8 @@ func (s stringListFlag) values() []string {
 	return result
 }
 
-func normalizeGCPProjects(projects []string) ([]string, error) {
-	normalized := normalizeStrings(projects)
+func NormalizeGCPProjects(projects []string) ([]string, error) {
+	normalized := NormalizeStrings(projects)
 	if len(normalized) == 0 {
 		return nil, nil
 	}
@@ -219,7 +219,7 @@ func normalizeGCPProjects(projects []string) ([]string, error) {
 	result := make([]string, 0, len(normalized))
 	seen := make(map[string]struct{}, len(normalized))
 	for _, project := range normalized {
-		if _, err := googlePrometheusTargetURL(project); err != nil {
+		if _, err := GooglePrometheusTargetURL(project); err != nil {
 			return nil, err
 		}
 		if _, ok := seen[project]; ok {
@@ -231,7 +231,7 @@ func normalizeGCPProjects(projects []string) ([]string, error) {
 	return result, nil
 }
 
-func googlePrometheusTargetURL(projectID string) (string, error) {
+func GooglePrometheusTargetURL(projectID string) (string, error) {
 	projectID = strings.TrimSpace(projectID)
 	if projectID == "" {
 		return "", fmt.Errorf("query.gcp-project cannot contain an empty project ID")
@@ -239,24 +239,24 @@ func googlePrometheusTargetURL(projectID string) (string, error) {
 	return fmt.Sprintf("https://monitoring.googleapis.com/v1/projects/%s/location/global/prometheus", url.PathEscape(projectID)), nil
 }
 
-func newQueryBackendConfig(queryTargetURL string, headers map[string]string, queryParams map[string][]string, googleAuth bool, credentialsFile string, scopes []string) (*queryBackendConfig, error) {
-	normalizedHeaders, err := normalizeHeaders(headers)
+func NewQueryBackendConfig(queryTargetURL string, headers map[string]string, queryParams map[string][]string, googleAuth bool, credentialsFile string, scopes []string) (*QueryBackendConfig, error) {
+	normalizedHeaders, err := NormalizeHeaders(headers)
 	if err != nil {
 		return nil, err
 	}
-	normalizedQueryParams, err := normalizeQueryParams(queryParams)
+	normalizedQueryParams, err := NormalizeQueryParams(queryParams)
 	if err != nil {
 		return nil, err
 	}
 
-	cfg := &queryBackendConfig{
+	cfg := &QueryBackendConfig{
 		QueryTargetURL: strings.TrimSpace(queryTargetURL),
 		Headers:        normalizedHeaders,
 		QueryParams:    normalizedQueryParams,
-		Auth: queryBackendAuthConfig{
+		Auth: QueryBackendAuthConfig{
 			Google:          googleAuth,
 			CredentialsFile: strings.TrimSpace(credentialsFile),
-			Scopes:          normalizeStrings(scopes),
+			Scopes:          NormalizeStrings(scopes),
 		},
 	}
 
@@ -266,7 +266,7 @@ func newQueryBackendConfig(queryTargetURL string, headers map[string]string, que
 	return cfg, nil
 }
 
-func backendTargetURL(config queryBackendConfig) (string, error) {
+func BackendTargetURL(config QueryBackendConfig) (string, error) {
 	targetURL := strings.TrimSpace(config.QueryTargetURL)
 	if len(config.QueryParams) == 0 {
 		return targetURL, nil
@@ -286,7 +286,7 @@ func backendTargetURL(config queryBackendConfig) (string, error) {
 	return parsedURL.String(), nil
 }
 
-func normalizeHeaders(headers map[string]string) (map[string]string, error) {
+func NormalizeHeaders(headers map[string]string) (map[string]string, error) {
 	if len(headers) == 0 {
 		return nil, nil
 	}
@@ -302,7 +302,7 @@ func normalizeHeaders(headers map[string]string) (map[string]string, error) {
 	return result, nil
 }
 
-func normalizeQueryParams(params map[string][]string) (map[string][]string, error) {
+func NormalizeQueryParams(params map[string][]string) (map[string][]string, error) {
 	if len(params) == 0 {
 		return nil, nil
 	}
@@ -332,7 +332,7 @@ func cloneQueryParams(params map[string][]string) map[string][]string {
 	return result
 }
 
-func normalizeStrings(values []string) []string {
+func NormalizeStrings(values []string) []string {
 	if len(values) == 0 {
 		return nil
 	}
