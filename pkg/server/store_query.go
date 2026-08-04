@@ -3,9 +3,7 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/api/prometheus/v1"
@@ -26,17 +24,18 @@ type QueryServer struct {
 	dropLabels         promql.LabelDropSet
 	SeriesStep         time.Duration
 	MaxPointsPerSeries int
+	labelCache         *labelMatchCache
 }
 
-func NewQueryServer(queryBackendClient backend.QueryBackendAPI, dropLabels []string, externalLabels func() labels.Labels, seriesStep time.Duration, maxPointsPerSeries int) *QueryServer {
+func NewQueryServer(queryBackendClient backend.QueryBackendAPI, dropLabels []string, externalLabels func() labels.Labels, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL time.Duration) *QueryServer {
 	return NewQueryServerFromBackends([]backend.QueryBackendEndpoint{{
 		Name:           "backend",
 		Client:         queryBackendClient,
 		ExternalLabels: externalLabels,
-	}}, dropLabels, seriesStep, maxPointsPerSeries)
+	}}, dropLabels, seriesStep, maxPointsPerSeries, labelCacheTTL)
 }
 
-func NewQueryServerFromBackends(backends []backend.QueryBackendEndpoint, dropLabels []string, seriesStep time.Duration, maxPointsPerSeries int) *QueryServer {
+func NewQueryServerFromBackends(backends []backend.QueryBackendEndpoint, dropLabels []string, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL time.Duration) *QueryServer {
 	normalized := make([]backend.QueryBackendEndpoint, 0, len(backends))
 	for _, b := range backends {
 		if b.ExternalLabels == nil {
@@ -60,6 +59,7 @@ func NewQueryServerFromBackends(backends []backend.QueryBackendEndpoint, dropLab
 		dropLabels:         promql.NewLabelDropSet(dropLabels),
 		SeriesStep:         seriesStep,
 		MaxPointsPerSeries: maxPointsPerSeries,
+		labelCache:         newLabelMatchCache(labelCacheTTL),
 	}
 }
 
@@ -233,7 +233,7 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 			start := promql.TimeFromMillis(request.Start)
 			end := promql.TimeFromMillis(request.End)
 
-			matched, backendWarnings, err := hasMatchingSeries(ctx, b, selector, matches, start, end)
+			matched, backendWarnings, err := qs.hasMatchingSeries(ctx, b, selector, matches, start, end)
 			if err != nil {
 				return nil, status.Error(codes.Internal, err.Error())
 			}
@@ -399,7 +399,11 @@ func (qs *QueryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 	return nil
 }
 
-func hasMatchingSeries(ctx context.Context, b backend.QueryBackendEndpoint, selector string, matches []string, start, end time.Time) (bool, v1.Warnings, error) {
+func (qs *QueryServer) hasMatchingSeries(ctx context.Context, b backend.QueryBackendEndpoint, selector string, matches []string, start, end time.Time) (bool, v1.Warnings, error) {
+	if matched, ok := qs.labelCache.Get(b.Name, selector); ok {
+		return matched, nil, nil
+	}
+
 	ts := end
 	if ts.IsZero() {
 		ts = time.Now().UTC()
@@ -407,27 +411,16 @@ func hasMatchingSeries(ctx context.Context, b backend.QueryBackendEndpoint, sele
 
 	val, warnings, err := b.Client.Query(ctx, selector, ts)
 	if err == nil {
-		if valueHasSamples(val) {
-			return true, warnings, nil
-		}
-		if !strings.Contains(selector, "[") {
-			rangeSelector := fmt.Sprintf("max_over_time(%s[1h])", selector)
-			rangeVal, rangeWarnings, rangeErr := b.Client.Query(ctx, rangeSelector, ts)
-			warnings = append(warnings, rangeWarnings...)
-			if rangeErr == nil && valueHasSamples(rangeVal) {
-				return true, warnings, nil
-			}
-		}
-		return false, warnings, nil
+		matched := valueHasSamples(val)
+		qs.labelCache.Put(b.Name, selector, matched)
+		return matched, warnings, nil
 	}
 
-	seriesList, seriesWarnings, seriesErr := b.Client.Series(ctx, matches, start, end)
+	seriesList, seriesWarnings, _ := b.Client.Series(ctx, matches, start, end)
 	warnings = append(warnings, seriesWarnings...)
-	if seriesErr == nil && len(seriesList) > 0 {
-		return true, warnings, nil
-	}
-
-	return false, warnings, nil
+	matched := len(seriesList) > 0
+	qs.labelCache.Put(b.Name, selector, matched)
+	return matched, warnings, nil
 }
 
 func valueHasSamples(val model.Value) bool {

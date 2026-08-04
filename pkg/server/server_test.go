@@ -288,7 +288,7 @@ func TestSeriesSkipsEmptyBackendStreams(t *testing.T) {
 		queryRangeValue: model.Matrix{
 			&model.SampleStream{Metric: model.Metric{"__name__": "up", "job": "api"}, Values: []model.SamplePair{}},
 		},
-	}, nil, nil, time.Minute, 11000)
+	}, nil, nil, time.Minute, 11000, 5*time.Minute)
 
 	stream := &fakeStoreSeriesServer{}
 	err := server.Series(&storepb.SeriesRequest{
@@ -318,7 +318,7 @@ func TestSeriesSortsByFinalLabels(t *testing.T) {
 				Values: []model.SamplePair{{Timestamp: 1000, Value: 1}},
 			},
 		},
-	}, nil, nil, time.Minute, 11000)
+	}, nil, nil, time.Minute, 11000, 5*time.Minute)
 
 	stream := &fakeStoreSeriesServer{}
 	err := server.Series(&storepb.SeriesRequest{
@@ -349,7 +349,7 @@ func TestSeriesMetadataSortsByFinalLabels(t *testing.T) {
 			{"__name__": "up", "job": "worker"},
 			{"__name__": "up", "job": "api"},
 		},
-	}, nil, nil, time.Minute, 11000)
+	}, nil, nil, time.Minute, 11000, 5*time.Minute)
 
 	stream := &fakeStoreSeriesServer{}
 	err := server.Series(&storepb.SeriesRequest{
@@ -388,6 +388,7 @@ func TestQueryUsesQueryPlan(t *testing.T) {
 		nil,
 		time.Minute,
 		11000,
+		5*time.Minute,
 	)
 
 	queryPlan, err := querypb.NewJSONEncodedPlan(&logicalplan.VectorSelector{
@@ -430,6 +431,7 @@ func TestQueryRangeUsesQueryPlan(t *testing.T) {
 		nil,
 		time.Minute,
 		11000,
+		5*time.Minute,
 	)
 
 	queryPlan, err := querypb.NewJSONEncodedPlan(&logicalplan.VectorSelector{
@@ -596,6 +598,7 @@ func TestLabelValuesReturnsExternalLabelWithBackendMatchers(t *testing.T) {
 		func() labels.Labels { return labels.FromStrings("prometheus", "gcp-itk8s-208609") },
 		time.Minute,
 		11000,
+		5*time.Minute,
 	)
 
 	resp, err := server.LabelValues(context.Background(), &storepb.LabelValuesRequest{
@@ -637,7 +640,7 @@ func TestLabelValuesReturnsExternalLabelsForMultipleBackends(t *testing.T) {
 			},
 			ExternalLabels: backend.StaticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-space-prod")),
 		},
-	}, nil, time.Minute, 11000)
+	}, nil, time.Minute, 11000, 5*time.Minute)
 
 	resp, err := server.LabelValues(context.Background(), &storepb.LabelValuesRequest{
 		Label: "prometheus",
@@ -678,7 +681,7 @@ func TestLabelValuesRoutesExternalLabelMatcherToOneBackend(t *testing.T) {
 			},
 			ExternalLabels: backend.StaticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-space-prod")),
 		},
-	}, nil, time.Minute, 11000)
+	}, nil, time.Minute, 11000, 5*time.Minute)
 
 	resp, err := server.LabelValues(context.Background(), &storepb.LabelValuesRequest{
 		Label: "prometheus",
@@ -707,6 +710,7 @@ func TestLabelValuesFiltersOutExternalLabelWhenBackendHasNoMatchingSeries(t *tes
 		func() labels.Labels { return labels.FromStrings("prometheus", "gcp-itk8s-208609") },
 		time.Minute,
 		11000,
+		5*time.Minute,
 	)
 
 	resp, err := server.LabelValues(context.Background(), &storepb.LabelValuesRequest{
@@ -748,7 +752,7 @@ func TestLabelValuesReadsNonExternalLabelFromSelectedBackend(t *testing.T) {
 			},
 			ExternalLabels: backend.StaticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-space-prod")),
 		},
-	}, nil, time.Minute, 11000)
+	}, nil, time.Minute, 11000, 5*time.Minute)
 
 	resp, err := server.LabelValues(context.Background(), &storepb.LabelValuesRequest{
 		Label: "monitored_resource",
@@ -784,5 +788,83 @@ func TestLabelValuesReadsNonExternalLabelFromSelectedBackend(t *testing.T) {
 	}
 	if !strings.Contains(call.matches[0], `__name__="logging_googleapis_com:byte_count"`) || !strings.Contains(call.matches[0], `location="global"`) {
 		t.Fatalf("LabelValues() backend selector = %q, want non-external matchers kept", call.matches[0])
+	}
+}
+
+func TestLabelMatchCacheHitAvoidsSecondBackendCall(t *testing.T) {
+	queryCalls := make([]fakeQueryCall, 0, 2)
+	server := NewQueryServer(
+		fakeQueryBackendAPI{
+			queryValue: model.Vector{
+				&model.Sample{Metric: model.Metric{"__name__": "cloudsql_googleapis_com:database_cpu_utilization"}, Value: 1, Timestamp: 1000},
+			},
+			queryCalls: &queryCalls,
+		},
+		nil,
+		func() labels.Labels { return labels.FromStrings("prometheus", "gcp-itk8s-208609") },
+		time.Minute,
+		11000,
+		5*time.Minute,
+	)
+
+	req := &storepb.LabelValuesRequest{
+		Label: "prometheus",
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "cloudsql_googleapis_com:database_cpu_utilization"},
+		},
+	}
+
+	resp1, err := server.LabelValues(context.Background(), req)
+	if err != nil {
+		t.Fatalf("first LabelValues() returned error: %v", err)
+	}
+	if len(resp1.Values) != 1 || resp1.Values[0] != "gcp-itk8s-208609" {
+		t.Fatalf("first LabelValues().Values = %v, want [gcp-itk8s-208609]", resp1.Values)
+	}
+	if len(queryCalls) != 1 {
+		t.Fatalf("query calls count = %d, want 1", len(queryCalls))
+	}
+
+	// Second request should hit cache and NOT make another query call
+	resp2, err := server.LabelValues(context.Background(), req)
+	if err != nil {
+		t.Fatalf("second LabelValues() returned error: %v", err)
+	}
+	if !reflect.DeepEqual(resp1.Values, resp2.Values) {
+		t.Fatalf("second LabelValues().Values = %v, want %v", resp2.Values, resp1.Values)
+	}
+	if len(queryCalls) != 1 {
+		t.Fatalf("query calls count after cache hit = %d, want 1", len(queryCalls))
+	}
+}
+
+func TestLabelMatchCacheDisabledWhenTTLZero(t *testing.T) {
+	queryCalls := make([]fakeQueryCall, 0, 2)
+	server := NewQueryServer(
+		fakeQueryBackendAPI{
+			queryValue: model.Vector{
+				&model.Sample{Metric: model.Metric{"__name__": "up"}, Value: 1, Timestamp: 1000},
+			},
+			queryCalls: &queryCalls,
+		},
+		nil,
+		func() labels.Labels { return labels.FromStrings("prometheus", "gcp-itk8s-208609") },
+		time.Minute,
+		11000,
+		0,
+	)
+
+	req := &storepb.LabelValuesRequest{
+		Label: "prometheus",
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "up"},
+		},
+	}
+
+	_, _ = server.LabelValues(context.Background(), req)
+	_, _ = server.LabelValues(context.Background(), req)
+
+	if len(queryCalls) != 2 {
+		t.Fatalf("query calls count with TTL=0 = %d, want 2", len(queryCalls))
 	}
 }
