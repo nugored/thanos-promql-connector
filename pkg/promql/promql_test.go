@@ -23,7 +23,7 @@ func TestQuerySelectorFromMatchers(t *testing.T) {
 		t.Fatalf("QuerySelectorFromMatchers() returned error: %v", err)
 	}
 
-	want := `{__name__="up", job=~"api|worker"}`
+	want := `up{job=~"api|worker"}`
 	if selector != want {
 		t.Fatalf("QuerySelectorFromMatchers() = %q, want %q", selector, want)
 	}

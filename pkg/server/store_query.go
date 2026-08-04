@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/api/prometheus/v1"
@@ -221,7 +223,24 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 		}
 
 		if value := externalLabels.Get(request.Label); value != "" {
-			valueSet[value] = struct{}{}
+			if len(promMatchers) == 0 {
+				valueSet[value] = struct{}{}
+				continue
+			}
+
+			matches := promql.LabelAPISelectorsFromPromMatchers(promMatchers)
+			selector := promql.QuerySelectorFromPromMatchers(promMatchers)
+			start := promql.TimeFromMillis(request.Start)
+			end := promql.TimeFromMillis(request.End)
+
+			matched, backendWarnings, err := hasMatchingSeries(ctx, b, selector, matches, start, end)
+			if err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
+			warnings = append(warnings, backendWarnings...)
+			if matched {
+				valueSet[value] = struct{}{}
+			}
 			continue
 		}
 
@@ -378,4 +397,56 @@ func (qs *QueryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 		}
 	}
 	return nil
+}
+
+func hasMatchingSeries(ctx context.Context, b backend.QueryBackendEndpoint, selector string, matches []string, start, end time.Time) (bool, v1.Warnings, error) {
+	ts := end
+	if ts.IsZero() {
+		ts = time.Now().UTC()
+	}
+
+	val, warnings, err := b.Client.Query(ctx, selector, ts)
+	if err == nil {
+		if valueHasSamples(val) {
+			return true, warnings, nil
+		}
+		if !strings.Contains(selector, "[") {
+			rangeSelector := fmt.Sprintf("max_over_time(%s[1h])", selector)
+			rangeVal, rangeWarnings, rangeErr := b.Client.Query(ctx, rangeSelector, ts)
+			warnings = append(warnings, rangeWarnings...)
+			if rangeErr == nil && valueHasSamples(rangeVal) {
+				return true, warnings, nil
+			}
+		}
+		return false, warnings, nil
+	}
+
+	seriesList, seriesWarnings, seriesErr := b.Client.Series(ctx, matches, start, end)
+	warnings = append(warnings, seriesWarnings...)
+	if seriesErr == nil && len(seriesList) > 0 {
+		return true, warnings, nil
+	}
+
+	return false, warnings, nil
+}
+
+func valueHasSamples(val model.Value) bool {
+	if val == nil {
+		return false
+	}
+	switch v := val.(type) {
+	case model.Vector:
+		return len(v) > 0
+	case model.Matrix:
+		for _, stream := range v {
+			if stream != nil && len(stream.Values) > 0 {
+				return true
+			}
+		}
+		return false
+	case *model.Scalar:
+		return v != nil
+	default:
+		return false
+	}
 }
