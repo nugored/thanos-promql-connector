@@ -221,20 +221,7 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 		}
 
 		if value := externalLabels.Get(request.Label); value != "" {
-			if len(promMatchers) == 0 {
-				valueSet[value] = struct{}{}
-				continue
-			}
-
-			matches := promql.LabelAPISelectorsFromPromMatchers(promMatchers)
-			seriesList, backendWarnings, err := b.Client.Series(ctx, matches, promql.TimeFromMillis(request.Start), promql.TimeFromMillis(request.End))
-			if err != nil {
-				return nil, status.Error(codes.Internal, err.Error())
-			}
-			warnings = append(warnings, backendWarnings...)
-			if len(seriesList) > 0 {
-				valueSet[value] = struct{}{}
-			}
+			valueSet[value] = struct{}{}
 			continue
 		}
 
