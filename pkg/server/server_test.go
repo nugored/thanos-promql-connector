@@ -7,7 +7,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -588,7 +587,11 @@ func TestParseInfoAPIMode(t *testing.T) {
 
 func TestLabelValuesReturnsExternalLabelWithBackendMatchers(t *testing.T) {
 	server := NewQueryServer(
-		fakeQueryBackendAPI{err: errors.New("backend should not be queried")},
+		fakeQueryBackendAPI{
+			seriesLabelSets: []model.LabelSet{
+				{"__name__": "logging_googleapis_com:byte_count", "monitored_resource": "gce_backend_service"},
+			},
+		},
 		nil,
 		func() labels.Labels { return labels.FromStrings("prometheus", "gcp-itk8s-208609") },
 		time.Minute,
@@ -617,13 +620,21 @@ func TestLabelValuesReturnsExternalLabelWithBackendMatchers(t *testing.T) {
 func TestLabelValuesReturnsExternalLabelsForMultipleBackends(t *testing.T) {
 	server := NewQueryServerFromBackends([]backend.QueryBackendEndpoint{
 		{
-			Name:           "itk8s-208609",
-			Client:         fakeQueryBackendAPI{err: errors.New("backend should not be queried")},
+			Name: "itk8s-208609",
+			Client: fakeQueryBackendAPI{
+				seriesLabelSets: []model.LabelSet{
+					{"__name__": "logging_googleapis_com:byte_count"},
+				},
+			},
 			ExternalLabels: backend.StaticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-itk8s-208609")),
 		},
 		{
-			Name:           "space-prod",
-			Client:         fakeQueryBackendAPI{err: errors.New("backend should not be queried")},
+			Name: "space-prod",
+			Client: fakeQueryBackendAPI{
+				seriesLabelSets: []model.LabelSet{
+					{"__name__": "logging_googleapis_com:byte_count"},
+				},
+			},
 			ExternalLabels: backend.StaticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-space-prod")),
 		},
 	}, nil, time.Minute, 11000)
@@ -650,13 +661,21 @@ func TestLabelValuesReturnsExternalLabelsForMultipleBackends(t *testing.T) {
 func TestLabelValuesRoutesExternalLabelMatcherToOneBackend(t *testing.T) {
 	server := NewQueryServerFromBackends([]backend.QueryBackendEndpoint{
 		{
-			Name:           "itk8s-208609",
-			Client:         fakeQueryBackendAPI{err: errors.New("backend should not be queried")},
+			Name: "itk8s-208609",
+			Client: fakeQueryBackendAPI{
+				seriesLabelSets: []model.LabelSet{
+					{"__name__": "logging_googleapis_com:byte_count"},
+				},
+			},
 			ExternalLabels: backend.StaticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-itk8s-208609")),
 		},
 		{
-			Name:           "space-prod",
-			Client:         fakeQueryBackendAPI{err: errors.New("backend should not be queried")},
+			Name: "space-prod",
+			Client: fakeQueryBackendAPI{
+				seriesLabelSets: []model.LabelSet{
+					{"__name__": "logging_googleapis_com:byte_count"},
+				},
+			},
 			ExternalLabels: backend.StaticExternalLabelsFunc(labels.FromStrings("prometheus", "gcp-space-prod")),
 		},
 	}, nil, time.Minute, 11000)
@@ -676,6 +695,32 @@ func TestLabelValuesRoutesExternalLabelMatcherToOneBackend(t *testing.T) {
 	want := []string{"gcp-space-prod"}
 	if !reflect.DeepEqual(resp.Values, want) {
 		t.Fatalf("LabelValues().Values = %v, want %v", resp.Values, want)
+	}
+}
+
+func TestLabelValuesFiltersOutExternalLabelWhenBackendHasNoMatchingSeries(t *testing.T) {
+	server := NewQueryServer(
+		fakeQueryBackendAPI{
+			seriesLabelSets: nil,
+		},
+		nil,
+		func() labels.Labels { return labels.FromStrings("prometheus", "gcp-itk8s-208609") },
+		time.Minute,
+		11000,
+	)
+
+	resp, err := server.LabelValues(context.Background(), &storepb.LabelValuesRequest{
+		Label: "prometheus",
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "definitely_not_a_real_metric_xyz123"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("LabelValues() returned error: %v", err)
+	}
+
+	if len(resp.Values) != 0 {
+		t.Fatalf("LabelValues().Values = %v, want empty list []", resp.Values)
 	}
 }
 
