@@ -59,6 +59,10 @@ var (
 		"Maximum backend query_range points per series for StoreAPI series requests. The connector increases the backend step for long ranges when needed. Set 0 to disable connector-side clamping; backend limits still apply.")
 	queryLabelCacheTTL = flag.Duration("query.label-cache-ttl", 5*time.Minute,
 		"How long to cache backend label matcher search results for external label queries. Set 0 to disable caching.")
+	queryLabelNamesCacheTTL = flag.Duration("query.label-names-cache-ttl", 5*time.Minute,
+		"How long to cache backend LabelNames search results. Set 0 to disable caching.")
+	queryLabelValuesCacheTTL = flag.Duration("query.label-values-cache-ttl", 5*time.Minute,
+		"How long to cache backend LabelValues search results. Set 0 to disable caching.")
 	connectorAddress = flag.String("connector-address", ":8081",
 		"Address on which to expose the query grpc server.")
 	grpcServerTLSCertFile = flag.String("grpc-server-tls-cert", "",
@@ -331,7 +335,7 @@ func main() {
 			os.Exit(1)
 		}
 		grpcServer := grpc.NewServer(serverOptions...)
-		queryServer := server.NewQueryServerFromBackends(queryBackends, queryDropLabels.Values(), *querySeriesStep, *queryMaxPointsPerSeries, *queryLabelCacheTTL)
+		queryServer := server.NewQueryServerWithCacheTTLs(queryBackends, queryDropLabels.Values(), *querySeriesStep, *queryMaxPointsPerSeries, *queryLabelCacheTTL, *queryLabelNamesCacheTTL, *queryLabelValuesCacheTTL)
 		storepb.RegisterStoreServer(grpcServer, queryServer)
 		querypb.RegisterQueryServer(grpcServer, queryServer)
 		infopb.RegisterInfoServer(grpcServer, &server.InfoServer{

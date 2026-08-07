@@ -28,6 +28,8 @@ import (
 )
 
 type fakeQueryBackendAPI struct {
+	labelNames       []string
+	labelNamesCalls  *[]fakeLabelNamesCall
 	labelValues      map[string]model.LabelValues
 	labelValuesCalls *[]fakeLabelValuesCall
 	seriesLabelSets  []model.LabelSet
@@ -36,6 +38,12 @@ type fakeQueryBackendAPI struct {
 	queryRangeValue  model.Value
 	queryRangeCalls  *[]fakeQueryRangeCall
 	err              error
+}
+
+type fakeLabelNamesCall struct {
+	matches   []string
+	startTime time.Time
+	endTime   time.Time
 }
 
 type fakeLabelValuesCall struct {
@@ -60,7 +68,17 @@ func (f fakeQueryBackendAPI) Config(ctx context.Context) (v1.ConfigResult, error
 }
 
 func (f fakeQueryBackendAPI) LabelNames(ctx context.Context, matches []string, startTime, endTime time.Time, opts ...v1.Option) ([]string, v1.Warnings, error) {
-	return nil, nil, nil
+	if f.labelNamesCalls != nil {
+		*f.labelNamesCalls = append(*f.labelNamesCalls, fakeLabelNamesCall{
+			matches:   append([]string(nil), matches...),
+			startTime: startTime,
+			endTime:   endTime,
+		})
+	}
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	return f.labelNames, nil, nil
 }
 
 func (f fakeQueryBackendAPI) LabelValues(ctx context.Context, label string, matches []string, startTime, endTime time.Time, opts ...v1.Option) (model.LabelValues, v1.Warnings, error) {
@@ -866,5 +884,140 @@ func TestLabelMatchCacheDisabledWhenTTLZero(t *testing.T) {
 
 	if len(queryCalls) != 2 {
 		t.Fatalf("query calls count with TTL=0 = %d, want 2", len(queryCalls))
+	}
+}
+
+func TestLabelNamesCacheHitAvoidsSecondBackendCall(t *testing.T) {
+	labelNamesCalls := make([]fakeLabelNamesCall, 0, 2)
+	server := NewQueryServerWithCacheTTLs(
+		[]backend.QueryBackendEndpoint{{
+			Name: "backend",
+			Client: fakeQueryBackendAPI{
+				labelNames:      []string{"app", "instance", "job"},
+				labelNamesCalls: &labelNamesCalls,
+			},
+		}},
+		nil,
+		time.Minute,
+		11000,
+		5*time.Minute,
+		5*time.Minute,
+		5*time.Minute,
+	)
+
+	req := &storepb.LabelNamesRequest{
+		Start: 1000000,
+		End:   2000000,
+	}
+
+	resp1, err := server.LabelNames(context.Background(), req)
+	if err != nil {
+		t.Fatalf("first LabelNames() error: %v", err)
+	}
+	if !reflect.DeepEqual(resp1.Names, []string{"app", "instance", "job"}) {
+		t.Fatalf("first LabelNames() = %v, want [app, instance, job]", resp1.Names)
+	}
+	if len(labelNamesCalls) != 1 {
+		t.Fatalf("labelNamesCalls count = %d, want 1", len(labelNamesCalls))
+	}
+
+	// Second request within TTL should hit cache
+	resp2, err := server.LabelNames(context.Background(), req)
+	if err != nil {
+		t.Fatalf("second LabelNames() error: %v", err)
+	}
+	if !reflect.DeepEqual(resp2.Names, resp1.Names) {
+		t.Fatalf("second LabelNames() = %v, want %v", resp2.Names, resp1.Names)
+	}
+	if len(labelNamesCalls) != 1 {
+		t.Fatalf("labelNamesCalls count after cache hit = %d, want 1", len(labelNamesCalls))
+	}
+}
+
+func TestLabelValuesCacheHitAvoidsSecondBackendCall(t *testing.T) {
+	labelValuesCalls := make([]fakeLabelValuesCall, 0, 2)
+	server := NewQueryServerWithCacheTTLs(
+		[]backend.QueryBackendEndpoint{{
+			Name: "backend",
+			Client: fakeQueryBackendAPI{
+				labelValues: map[string]model.LabelValues{
+					"job": {"api", "worker"},
+				},
+				labelValuesCalls: &labelValuesCalls,
+			},
+		}},
+		nil,
+		time.Minute,
+		11000,
+		5*time.Minute,
+		5*time.Minute,
+		5*time.Minute,
+	)
+
+	req := &storepb.LabelValuesRequest{
+		Label: "job",
+		Start: 1000000,
+		End:   2000000,
+	}
+
+	resp1, err := server.LabelValues(context.Background(), req)
+	if err != nil {
+		t.Fatalf("first LabelValues() error: %v", err)
+	}
+	if !reflect.DeepEqual(resp1.Values, []string{"api", "worker"}) {
+		t.Fatalf("first LabelValues() = %v, want [api, worker]", resp1.Values)
+	}
+	if len(labelValuesCalls) != 1 {
+		t.Fatalf("labelValuesCalls count = %d, want 1", len(labelValuesCalls))
+	}
+
+	// Second request within TTL should hit cache
+	resp2, err := server.LabelValues(context.Background(), req)
+	if err != nil {
+		t.Fatalf("second LabelValues() error: %v", err)
+	}
+	if !reflect.DeepEqual(resp2.Values, resp1.Values) {
+		t.Fatalf("second LabelValues() = %v, want %v", resp2.Values, resp1.Values)
+	}
+	if len(labelValuesCalls) != 1 {
+		t.Fatalf("labelValuesCalls count after cache hit = %d, want 1", len(labelValuesCalls))
+	}
+}
+
+func TestLabelNamesAndValuesCacheDisabledWhenTTLZero(t *testing.T) {
+	labelNamesCalls := make([]fakeLabelNamesCall, 0, 2)
+	labelValuesCalls := make([]fakeLabelValuesCall, 0, 2)
+	server := NewQueryServerWithCacheTTLs(
+		[]backend.QueryBackendEndpoint{{
+			Name: "backend",
+			Client: fakeQueryBackendAPI{
+				labelNames:      []string{"app", "job"},
+				labelNamesCalls: &labelNamesCalls,
+				labelValues: map[string]model.LabelValues{
+					"job": {"api"},
+				},
+				labelValuesCalls: &labelValuesCalls,
+			},
+		}},
+		nil,
+		time.Minute,
+		11000,
+		0,
+		0,
+		0,
+	)
+
+	namesReq := &storepb.LabelNamesRequest{Start: 1000, End: 2000}
+	_, _ = server.LabelNames(context.Background(), namesReq)
+	_, _ = server.LabelNames(context.Background(), namesReq)
+	if len(labelNamesCalls) != 2 {
+		t.Fatalf("labelNamesCalls with TTL=0 = %d, want 2", len(labelNamesCalls))
+	}
+
+	valuesReq := &storepb.LabelValuesRequest{Label: "job", Start: 1000, End: 2000}
+	_, _ = server.LabelValues(context.Background(), valuesReq)
+	_, _ = server.LabelValues(context.Background(), valuesReq)
+	if len(labelValuesCalls) != 2 {
+		t.Fatalf("labelValuesCalls with TTL=0 = %d, want 2", len(labelValuesCalls))
 	}
 }
