@@ -173,5 +173,5 @@ func CreateQueryBackendClient(queryConfig config.QueryBackendConfig) (QueryBacke
 	if err != nil {
 		return nil, fmt.Errorf("error creating client: %s", err)
 	}
-	return v1.NewAPI(client), nil
+	return NewSingleflightClient(v1.NewAPI(client)), nil
 }

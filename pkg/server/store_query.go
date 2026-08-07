@@ -25,6 +25,8 @@ type QueryServer struct {
 	SeriesStep         time.Duration
 	MaxPointsPerSeries int
 	labelCache         *labelMatchCache
+	labelNamesCache    *labelNamesCache
+	labelValuesCache   *labelValuesCache
 }
 
 func NewQueryServer(queryBackendClient backend.QueryBackendAPI, dropLabels []string, externalLabels func() labels.Labels, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL time.Duration) *QueryServer {
@@ -36,6 +38,10 @@ func NewQueryServer(queryBackendClient backend.QueryBackendAPI, dropLabels []str
 }
 
 func NewQueryServerFromBackends(backends []backend.QueryBackendEndpoint, dropLabels []string, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL time.Duration) *QueryServer {
+	return NewQueryServerWithCacheTTLs(backends, dropLabels, seriesStep, maxPointsPerSeries, labelCacheTTL, labelCacheTTL, labelCacheTTL)
+}
+
+func NewQueryServerWithCacheTTLs(backends []backend.QueryBackendEndpoint, dropLabels []string, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL, labelNamesCacheTTL, labelValuesCacheTTL time.Duration) *QueryServer {
 	normalized := make([]backend.QueryBackendEndpoint, 0, len(backends))
 	for _, b := range backends {
 		if b.ExternalLabels == nil {
@@ -60,6 +66,8 @@ func NewQueryServerFromBackends(backends []backend.QueryBackendEndpoint, dropLab
 		SeriesStep:         seriesStep,
 		MaxPointsPerSeries: maxPointsPerSeries,
 		labelCache:         newLabelMatchCache(labelCacheTTL),
+		labelNamesCache:    newLabelNamesCache(labelNamesCacheTTL),
+		labelValuesCache:   newLabelValuesCache(labelValuesCacheTTL),
 	}
 }
 
@@ -179,9 +187,17 @@ func (qs *QueryServer) LabelNames(ctx context.Context, request *storepb.LabelNam
 		}
 
 		matches := promql.LabelAPISelectorsFromPromMatchers(promMatchers)
-		names, backendWarnings, err := b.Client.LabelNames(ctx, matches, promql.TimeFromMillis(request.Start), promql.TimeFromMillis(request.End))
-		if err != nil {
-			return nil, status.Error(codes.Internal, err.Error())
+		startTime := promql.TimeFromMillis(request.Start)
+		endTime := promql.TimeFromMillis(request.End)
+
+		names, backendWarnings, cached := qs.labelNamesCache.Get(b.Name, matches, startTime, endTime)
+		if !cached {
+			var backendErr error
+			names, backendWarnings, backendErr = b.Client.LabelNames(ctx, matches, startTime, endTime)
+			if backendErr != nil {
+				return nil, status.Error(codes.Internal, backendErr.Error())
+			}
+			qs.labelNamesCache.Put(b.Name, matches, startTime, endTime, names, backendWarnings)
 		}
 		warnings = append(warnings, backendWarnings...)
 		for _, name := range qs.dropLabels.LabelNames(names, externalLabels, request.WithoutReplicaLabels) {
@@ -245,9 +261,17 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 		}
 
 		matches := promql.LabelAPISelectorsFromPromMatchers(promMatchers)
-		req, backendWarnings, err := b.Client.LabelValues(ctx, request.Label, matches, promql.TimeFromMillis(request.Start), promql.TimeFromMillis(request.End))
-		if err != nil {
-			return nil, status.Error(codes.Internal, err.Error())
+		startTime := promql.TimeFromMillis(request.Start)
+		endTime := promql.TimeFromMillis(request.End)
+
+		req, backendWarnings, cached := qs.labelValuesCache.Get(b.Name, request.Label, matches, startTime, endTime)
+		if !cached {
+			var backendErr error
+			req, backendWarnings, backendErr = b.Client.LabelValues(ctx, request.Label, matches, startTime, endTime)
+			if backendErr != nil {
+				return nil, status.Error(codes.Internal, backendErr.Error())
+			}
+			qs.labelValuesCache.Put(b.Name, request.Label, matches, startTime, endTime, req, backendWarnings)
 		}
 		warnings = append(warnings, backendWarnings...)
 		for _, value := range req {

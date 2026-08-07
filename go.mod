@@ -5,20 +5,19 @@ go 1.26.0
 require (
 	cloud.google.com/go/auth v0.17.0
 	github.com/go-kit/log v0.2.1
-	github.com/gogo/status v1.1.1
 	github.com/klauspost/compress v1.18.2
 	github.com/oklog/run v1.2.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/common v0.67.5
 	github.com/prometheus/prometheus v0.309.1
+	github.com/thanos-io/promql-engine v0.0.0-20260513095632-c5f6038078e3
 	github.com/thanos-io/thanos v0.42.2
-	google.golang.org/api v0.257.0
+	golang.org/x/sync v0.22.0
 	google.golang.org/grpc v1.81.1
 	gopkg.in/yaml.v2 v2.4.0
 )
 
 require (
-	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	github.com/VictoriaMetrics/easyproto v1.1.3 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -31,9 +30,7 @@ require (
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/gogo/googleapis v1.4.1 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
-	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.7 // indirect
 	github.com/googleapis/gax-go/v2 v2.15.0 // indirect
@@ -45,7 +42,6 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
-	github.com/thanos-io/promql-engine v0.0.0-20260513095632-c5f6038078e3 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.64.0 // indirect
 	go.opentelemetry.io/otel v1.43.0 // indirect
@@ -57,7 +53,6 @@ require (
 	go4.org/unsafe/assume-no-moving-gc v0.0.0-20231121144256-b99613f794b6 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260615183401-62b3387ff324 // indirect
