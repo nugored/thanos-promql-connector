@@ -110,24 +110,24 @@ func TestStringListFlagSet(t *testing.T) {
 }
 
 func TestNormalizeGCPProjectsDeduplicates(t *testing.T) {
-	got, err := NormalizeGCPProjects([]string{"itk8s-208609", " space-prod ", "itk8s-208609"})
+	got, err := NormalizeGCPProjects([]string{"my-gcp-project", " other-gcp-project ", "my-gcp-project"})
 	if err != nil {
 		t.Fatalf("NormalizeGCPProjects() returned error: %v", err)
 	}
 
-	want := []string{"itk8s-208609", "space-prod"}
+	want := []string{"my-gcp-project", "other-gcp-project"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("NormalizeGCPProjects() = %v, want %v", got, want)
 	}
 }
 
 func TestGooglePrometheusTargetURL(t *testing.T) {
-	got, err := GooglePrometheusTargetURL("itk8s-208609")
+	got, err := GooglePrometheusTargetURL("my-gcp-project")
 	if err != nil {
 		t.Fatalf("GooglePrometheusTargetURL() returned error: %v", err)
 	}
 
-	want := "https://monitoring.googleapis.com/v1/projects/itk8s-208609/location/global/prometheus"
+	want := "https://monitoring.googleapis.com/v1/projects/my-gcp-project/location/global/prometheus"
 	if got != want {
 		t.Fatalf("GooglePrometheusTargetURL() = %q, want %q", got, want)
 	}

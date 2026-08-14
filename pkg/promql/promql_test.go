@@ -61,6 +61,11 @@ func TestTimeFromMillis(t *testing.T) {
 	if !got.Equal(want) {
 		t.Fatalf("TimeFromMillis() = %s, want %s", got, want)
 	}
+
+	zero := TimeFromMillis(0)
+	if !zero.IsZero() {
+		t.Fatalf("TimeFromMillis(0) = %s, want zero time", zero)
+	}
 }
 
 func TestSeriesStep(t *testing.T) {
@@ -198,14 +203,14 @@ func TestLabelDropSetFiltersLabelsButKeepsPrometheusLabel(t *testing.T) {
 
 	got := dropLabels.ZLabelsFromMetric(model.Metric{
 		"__name__":      "up",
-		"__tenant_id__": "grazie",
-		"prometheus":    "grazie-prometheus",
+		"__tenant_id__": "tenant-a",
+		"prometheus":    "tenant-a-prometheus",
 	}, labels.EmptyLabels(), nil)
 
 	labelMap := ZLabelsToPromLabels(got).Map()
 	want := map[string]string{
 		"__name__":   "up",
-		"prometheus": "grazie-prometheus",
+		"prometheus": "tenant-a-prometheus",
 	}
 	if !reflect.DeepEqual(labelMap, want) {
 		t.Fatalf("ZLabelsFromMetric() = %v, want %v", labelMap, want)
