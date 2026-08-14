@@ -20,8 +20,8 @@ thanos query --endpoint 127.0.0.1:8081 --query.mode=distributed
 Query Cloud Managed Prometheus directly across one or more GCP projects:
 ```bash
 go run -tags slicelabels . \
-    --query.gcp-project=itk8s-208609 \
-    --query.gcp-project=space-prod
+    --query.gcp-project=my-gcp-project \
+    --query.gcp-project=other-gcp-project
 ```
 * Automatically uses Google Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`, gcloud ADC, or GKE Workload Identity).
 * Derives target URLs and virtual `prometheus=gcp-<PROJECT_ID>` labels automatically.

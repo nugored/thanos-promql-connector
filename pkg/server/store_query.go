@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -433,18 +434,40 @@ func (qs *QueryServer) hasMatchingSeries(ctx context.Context, b backend.QueryBac
 		ts = time.Now().UTC()
 	}
 
+	// 1. Fast path: Instant query for recent samples (last 5m)
 	val, warnings, err := b.Client.Query(ctx, selector, ts)
-	if err == nil {
-		matched := valueHasSamples(val)
-		qs.labelCache.Put(b.Name, selector, matched)
-		return matched, warnings, nil
+	if err == nil && valueHasSamples(val) {
+		qs.labelCache.Put(b.Name, selector, true)
+		return true, warnings, nil
 	}
 
-	seriesList, seriesWarnings, _ := b.Client.Series(ctx, matches, start, end)
+	// 2. Range selector query: for sparse/infrequent metrics (e.g. GCP Cloud Storage metrics),
+	// query over a 6-hour lookback window (or the requested start-end range)
+	lookback := 6 * time.Hour
+	if !start.IsZero() && !end.IsZero() && end.After(start) {
+		reqLookback := end.Sub(start)
+		if reqLookback > lookback {
+			lookback = reqLookback
+		}
+	}
+	rangeSelector := fmt.Sprintf("%s[%dm]", selector, int(lookback.Minutes()))
+	rangeVal, rangeWarnings, rangeErr := b.Client.Query(ctx, rangeSelector, ts)
+	warnings = append(warnings, rangeWarnings...)
+	if rangeErr == nil && valueHasSamples(rangeVal) {
+		qs.labelCache.Put(b.Name, selector, true)
+		return true, warnings, nil
+	}
+
+	// 3. Fallback to Series API
+	seriesList, seriesWarnings, seriesErr := b.Client.Series(ctx, matches, start, end)
 	warnings = append(warnings, seriesWarnings...)
-	matched := len(seriesList) > 0
-	qs.labelCache.Put(b.Name, selector, matched)
-	return matched, warnings, nil
+	if seriesErr == nil && len(seriesList) > 0 {
+		qs.labelCache.Put(b.Name, selector, true)
+		return true, warnings, nil
+	}
+
+	qs.labelCache.Put(b.Name, selector, false)
+	return false, warnings, nil
 }
 
 func valueHasSamples(val model.Value) bool {

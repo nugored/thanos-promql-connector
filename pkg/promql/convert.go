@@ -79,6 +79,9 @@ func chunkFromModelSamples(samples []model.SamplePair) (storepb.AggrChunk, error
 }
 
 func TimeFromMillis(ms int64) time.Time {
+	if ms <= 0 {
+		return time.Time{}
+	}
 	return time.Unix(ms/1000, (ms%1000)*int64(time.Millisecond)).UTC()
 }
 
