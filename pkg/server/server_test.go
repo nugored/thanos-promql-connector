@@ -1,12 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-kit/log"
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
@@ -308,7 +311,7 @@ func TestNewGRPCServerOptionsLoadsClientCA(t *testing.T) {
 }
 
 func TestSeriesSkipsEmptyBackendStreams(t *testing.T) {
-	server := NewQueryServer(fakeQueryBackendAPI{
+	server := NewQueryServer(nil, fakeQueryBackendAPI{
 		queryRangeValue: model.Matrix{
 			&model.SampleStream{Metric: model.Metric{"__name__": "up", "job": "api"}, Values: []model.SamplePair{}},
 		},
@@ -331,7 +334,7 @@ func TestSeriesSkipsEmptyBackendStreams(t *testing.T) {
 }
 
 func TestSeriesSortsByFinalLabels(t *testing.T) {
-	server := NewQueryServer(fakeQueryBackendAPI{
+	server := NewQueryServer(nil, fakeQueryBackendAPI{
 		queryRangeValue: model.Matrix{
 			&model.SampleStream{
 				Metric: model.Metric{"__name__": "up", "job": "worker"},
@@ -368,7 +371,7 @@ func TestSeriesSortsByFinalLabels(t *testing.T) {
 }
 
 func TestSeriesMetadataSortsByFinalLabels(t *testing.T) {
-	server := NewQueryServer(fakeQueryBackendAPI{
+	server := NewQueryServer(nil, fakeQueryBackendAPI{
 		seriesLabelSets: []model.LabelSet{
 			{"__name__": "up", "job": "worker"},
 			{"__name__": "up", "job": "api"},
@@ -402,6 +405,7 @@ func TestSeriesMetadataSortsByFinalLabels(t *testing.T) {
 func TestQueryUsesQueryPlan(t *testing.T) {
 	calls := make([]fakeQueryCall, 0, 1)
 	server := NewQueryServer(
+		nil,
 		fakeQueryBackendAPI{
 			queryValue: model.Vector{
 				&model.Sample{Metric: model.Metric{"__name__": "up"}, Value: 1, Timestamp: 1000},
@@ -442,6 +446,7 @@ func TestQueryUsesQueryPlan(t *testing.T) {
 func TestQueryRangeUsesQueryPlan(t *testing.T) {
 	calls := make([]fakeQueryRangeCall, 0, 1)
 	server := NewQueryServer(
+		nil,
 		fakeQueryBackendAPI{
 			queryRangeValue: model.Matrix{
 				&model.SampleStream{
@@ -613,6 +618,7 @@ func TestParseInfoAPIMode(t *testing.T) {
 
 func TestLabelValuesReturnsExternalLabelWithBackendMatchers(t *testing.T) {
 	server := NewQueryServer(
+		nil,
 		fakeQueryBackendAPI{
 			queryValue: model.Vector{
 				&model.Sample{Metric: model.Metric{"__name__": "logging_googleapis_com:byte_count"}, Value: 1, Timestamp: 1000},
@@ -645,7 +651,7 @@ func TestLabelValuesReturnsExternalLabelWithBackendMatchers(t *testing.T) {
 }
 
 func TestLabelValuesReturnsExternalLabelsForMultipleBackends(t *testing.T) {
-	server := NewQueryServerFromBackends([]backend.QueryBackendEndpoint{
+	server := NewQueryServerFromBackends(nil, []backend.QueryBackendEndpoint{
 		{
 			Name: "my-gcp-project",
 			Client: fakeQueryBackendAPI{
@@ -686,7 +692,7 @@ func TestLabelValuesReturnsExternalLabelsForMultipleBackends(t *testing.T) {
 }
 
 func TestLabelValuesRoutesExternalLabelMatcherToOneBackend(t *testing.T) {
-	server := NewQueryServerFromBackends([]backend.QueryBackendEndpoint{
+	server := NewQueryServerFromBackends(nil, []backend.QueryBackendEndpoint{
 		{
 			Name: "my-gcp-project",
 			Client: fakeQueryBackendAPI{
@@ -727,6 +733,7 @@ func TestLabelValuesRoutesExternalLabelMatcherToOneBackend(t *testing.T) {
 
 func TestLabelValuesFiltersOutExternalLabelWhenBackendHasNoMatchingSeries(t *testing.T) {
 	server := NewQueryServer(
+		nil,
 		fakeQueryBackendAPI{
 			queryValue: model.Vector{},
 		},
@@ -754,6 +761,7 @@ func TestLabelValuesFiltersOutExternalLabelWhenBackendHasNoMatchingSeries(t *tes
 
 func TestLabelValuesReturnsExternalLabelWhenInstantQueryEmptyButSeriesExists(t *testing.T) {
 	server := NewQueryServer(
+		nil,
 		fakeQueryBackendAPI{
 			queryValue: model.Vector{},
 			seriesLabelSets: []model.LabelSet{
@@ -787,6 +795,7 @@ func TestLabelValuesReturnsExternalLabelWhenInstantQueryEmptyButSeriesExists(t *
 
 func TestLabelValuesReturnsExternalLabelWithZeroStartAndEnd(t *testing.T) {
 	server := NewQueryServer(
+		nil,
 		fakeQueryBackendAPI{
 			queryValue: model.Vector{},
 			seriesLabelSets: []model.LabelSet{
@@ -820,6 +829,7 @@ func TestLabelValuesReturnsExternalLabelWithZeroStartAndEnd(t *testing.T) {
 
 func TestLabelValuesReturnsExternalLabelWhenInstantQueryEmptyButRangeQueryMatrixHasSamples(t *testing.T) {
 	server := NewQueryServer(
+		nil,
 		fakeQueryBackendAPI{
 			queryMap: map[string]model.Value{
 				`{__name__="storage_googleapis_com:storage_v2_total_bytes"}`: model.Vector{},
@@ -859,7 +869,7 @@ func TestLabelValuesReturnsExternalLabelWhenInstantQueryEmptyButRangeQueryMatrix
 func TestLabelValuesReadsNonExternalLabelFromSelectedBackend(t *testing.T) {
 	myProjectCalls := make([]fakeLabelValuesCall, 0, 1)
 	spaceCalls := make([]fakeLabelValuesCall, 0, 1)
-	server := NewQueryServerFromBackends([]backend.QueryBackendEndpoint{
+	server := NewQueryServerFromBackends(nil, []backend.QueryBackendEndpoint{
 		{
 			Name: "my-gcp-project",
 			Client: fakeQueryBackendAPI{
@@ -922,6 +932,7 @@ func TestLabelValuesReadsNonExternalLabelFromSelectedBackend(t *testing.T) {
 func TestLabelMatchCacheHitAvoidsSecondBackendCall(t *testing.T) {
 	queryCalls := make([]fakeQueryCall, 0, 2)
 	server := NewQueryServer(
+		nil,
 		fakeQueryBackendAPI{
 			queryValue: model.Vector{
 				&model.Sample{Metric: model.Metric{"__name__": "cloudsql_googleapis_com:database_cpu_utilization"}, Value: 1, Timestamp: 1000},
@@ -969,6 +980,7 @@ func TestLabelMatchCacheHitAvoidsSecondBackendCall(t *testing.T) {
 func TestLabelMatchCacheDisabledWhenTTLZero(t *testing.T) {
 	queryCalls := make([]fakeQueryCall, 0, 2)
 	server := NewQueryServer(
+		nil,
 		fakeQueryBackendAPI{
 			queryValue: model.Vector{
 				&model.Sample{Metric: model.Metric{"__name__": "up"}, Value: 1, Timestamp: 1000},
@@ -1000,6 +1012,7 @@ func TestLabelMatchCacheDisabledWhenTTLZero(t *testing.T) {
 func TestLabelNamesCacheHitAvoidsSecondBackendCall(t *testing.T) {
 	labelNamesCalls := make([]fakeLabelNamesCall, 0, 2)
 	server := NewQueryServerWithCacheTTLs(
+		nil,
 		[]backend.QueryBackendEndpoint{{
 			Name: "backend",
 			Client: fakeQueryBackendAPI{
@@ -1047,6 +1060,7 @@ func TestLabelNamesCacheHitAvoidsSecondBackendCall(t *testing.T) {
 func TestLabelValuesCacheHitAvoidsSecondBackendCall(t *testing.T) {
 	labelValuesCalls := make([]fakeLabelValuesCall, 0, 2)
 	server := NewQueryServerWithCacheTTLs(
+		nil,
 		[]backend.QueryBackendEndpoint{{
 			Name: "backend",
 			Client: fakeQueryBackendAPI{
@@ -1098,6 +1112,7 @@ func TestLabelNamesAndValuesCacheDisabledWhenTTLZero(t *testing.T) {
 	labelNamesCalls := make([]fakeLabelNamesCall, 0, 2)
 	labelValuesCalls := make([]fakeLabelValuesCall, 0, 2)
 	server := NewQueryServerWithCacheTTLs(
+		nil,
 		[]backend.QueryBackendEndpoint{{
 			Name: "backend",
 			Client: fakeQueryBackendAPI{
@@ -1129,5 +1144,44 @@ func TestLabelNamesAndValuesCacheDisabledWhenTTLZero(t *testing.T) {
 	_, _ = server.LabelValues(context.Background(), valuesReq)
 	if len(labelValuesCalls) != 2 {
 		t.Fatalf("labelValuesCalls with TTL=0 = %d, want 2", len(labelValuesCalls))
+	}
+}
+
+func TestQueryLogsBackendError(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.NewJSONLogger(&buf)
+
+	server := NewQueryServerFromBackends(
+		logger,
+		[]backend.QueryBackendEndpoint{{
+			Name: "gcp-test-project",
+			Client: fakeQueryBackendAPI{
+				err: errors.New("422 Unprocessable Entity: Google API rate limit exceeded"),
+			},
+		}},
+		nil,
+		time.Minute,
+		11000,
+		5*time.Minute,
+	)
+
+	stream := &fakeQueryServerStream{}
+	err := server.Query(&querypb.QueryRequest{
+		TimeSeconds: 1000,
+		Query:       "up",
+	}, stream)
+	if err == nil {
+		t.Fatal("Query() expected error, got nil")
+	}
+
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "backend instant query failed") {
+		t.Errorf("log output missing msg, got %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "gcp-test-project") {
+		t.Errorf("log output missing backend name, got %q", logOutput)
+	}
+	if !strings.Contains(logOutput, "422 Unprocessable Entity") {
+		t.Errorf("log output missing error text, got %q", logOutput)
 	}
 }

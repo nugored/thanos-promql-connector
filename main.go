@@ -75,6 +75,8 @@ var (
 		"API support to advertise in the Info response. Valid values: store, query, both.")
 	grpcInfoAdvertiseQueryAPI = flag.Bool("grpc-info-advertise-query-api", false,
 		"Deprecated: advertise both StoreAPI and QueryAPI support in the Info response when grpc-info-api-mode is left as store.")
+	logLevel = flag.String("log.level", "info",
+		"Log level. Valid values: debug, info, warn, error. Can also be set via LOG_LEVEL or LOGGING_LEVEL environment variables.")
 	metricsAddress = flag.String("metrics-address", ":9090",
 		"Address on which to expose metrics")
 )
@@ -91,7 +93,16 @@ func init() {
 
 func main() {
 	flag.Parse()
+
+	logLevelVal := *logLevel
+	if envVal := os.Getenv("LOG_LEVEL"); envVal != "" {
+		logLevelVal = envVal
+	} else if envVal := os.Getenv("LOGGING_LEVEL"); envVal != "" {
+		logLevelVal = envVal
+	}
+
 	logger := log.NewJSONLogger(log.NewSyncWriter(os.Stderr))
+	logger = level.NewFilter(logger, level.Allow(level.ParseDefault(logLevelVal, level.InfoValue())))
 	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
 	logger = log.With(logger, "caller", log.DefaultCaller)
 
@@ -335,7 +346,7 @@ func main() {
 			os.Exit(1)
 		}
 		grpcServer := grpc.NewServer(serverOptions...)
-		queryServer := server.NewQueryServerWithCacheTTLs(queryBackends, queryDropLabels.Values(), *querySeriesStep, *queryMaxPointsPerSeries, *queryLabelCacheTTL, *queryLabelNamesCacheTTL, *queryLabelValuesCacheTTL)
+		queryServer := server.NewQueryServerWithCacheTTLs(logger, queryBackends, queryDropLabels.Values(), *querySeriesStep, *queryMaxPointsPerSeries, *queryLabelCacheTTL, *queryLabelNamesCacheTTL, *queryLabelValuesCacheTTL)
 		storepb.RegisterStoreServer(grpcServer, queryServer)
 		querypb.RegisterQueryServer(grpcServer, queryServer)
 		infopb.RegisterInfoServer(grpcServer, &server.InfoServer{

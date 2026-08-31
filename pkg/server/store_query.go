@@ -7,6 +7,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
@@ -21,6 +23,7 @@ import (
 )
 
 type QueryServer struct {
+	logger             log.Logger
 	backends           []backend.QueryBackendEndpoint
 	dropLabels         promql.LabelDropSet
 	SeriesStep         time.Duration
@@ -30,19 +33,22 @@ type QueryServer struct {
 	labelValuesCache   *labelValuesCache
 }
 
-func NewQueryServer(queryBackendClient backend.QueryBackendAPI, dropLabels []string, externalLabels func() labels.Labels, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL time.Duration) *QueryServer {
-	return NewQueryServerFromBackends([]backend.QueryBackendEndpoint{{
+func NewQueryServer(logger log.Logger, queryBackendClient backend.QueryBackendAPI, dropLabels []string, externalLabels func() labels.Labels, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL time.Duration) *QueryServer {
+	return NewQueryServerFromBackends(logger, []backend.QueryBackendEndpoint{{
 		Name:           "backend",
 		Client:         queryBackendClient,
 		ExternalLabels: externalLabels,
 	}}, dropLabels, seriesStep, maxPointsPerSeries, labelCacheTTL)
 }
 
-func NewQueryServerFromBackends(backends []backend.QueryBackendEndpoint, dropLabels []string, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL time.Duration) *QueryServer {
-	return NewQueryServerWithCacheTTLs(backends, dropLabels, seriesStep, maxPointsPerSeries, labelCacheTTL, labelCacheTTL, labelCacheTTL)
+func NewQueryServerFromBackends(logger log.Logger, backends []backend.QueryBackendEndpoint, dropLabels []string, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL time.Duration) *QueryServer {
+	return NewQueryServerWithCacheTTLs(logger, backends, dropLabels, seriesStep, maxPointsPerSeries, labelCacheTTL, labelCacheTTL, labelCacheTTL)
 }
 
-func NewQueryServerWithCacheTTLs(backends []backend.QueryBackendEndpoint, dropLabels []string, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL, labelNamesCacheTTL, labelValuesCacheTTL time.Duration) *QueryServer {
+func NewQueryServerWithCacheTTLs(logger log.Logger, backends []backend.QueryBackendEndpoint, dropLabels []string, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL, labelNamesCacheTTL, labelValuesCacheTTL time.Duration) *QueryServer {
+	if logger == nil {
+		logger = log.NewNopLogger()
+	}
 	normalized := make([]backend.QueryBackendEndpoint, 0, len(backends))
 	for _, b := range backends {
 		if b.ExternalLabels == nil {
@@ -62,6 +68,7 @@ func NewQueryServerWithCacheTTLs(backends []backend.QueryBackendEndpoint, dropLa
 	}
 
 	return &QueryServer{
+		logger:             logger,
 		backends:           normalized,
 		dropLabels:         promql.NewLabelDropSet(dropLabels),
 		SeriesStep:         seriesStep,
@@ -100,6 +107,7 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 		if request.SkipChunks {
 			backendSeriesSet, warnings, err := qs.seriesMetadataFromBackend(server.Context(), b, externalLabels, request, selector, start, end)
 			if err != nil {
+				level.Error(qs.logger).Log("msg", "backend series metadata query failed", "backend", b.Name, "selector", selector, "err", err)
 				return status.Error(codes.Aborted, err.Error())
 			}
 			if err := promql.SendStoreWarnings(server, warnings); err != nil {
@@ -116,6 +124,7 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 		}
 		values, warnings, err := b.Client.QueryRange(server.Context(), selector, interval)
 		if err != nil {
+			level.Error(qs.logger).Log("msg", "backend series query_range failed", "backend", b.Name, "selector", selector, "err", err)
 			return status.Error(codes.Aborted, err.Error())
 		}
 		if err := promql.SendStoreWarnings(server, warnings); err != nil {
@@ -124,7 +133,9 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 
 		matrix, ok := values.(model.Matrix)
 		if !ok {
-			return status.Errorf(codes.Internal, "backend returned %T for series selector %q, want model.Matrix", values, selector)
+			err := fmt.Errorf("backend returned %T for series selector %q, want model.Matrix", values, selector)
+			level.Error(qs.logger).Log("msg", "unexpected response type for backend series query_range", "backend", b.Name, "selector", selector, "err", err)
+			return status.Error(codes.Internal, err.Error())
 		}
 
 		for _, result := range matrix {
@@ -196,6 +207,7 @@ func (qs *QueryServer) LabelNames(ctx context.Context, request *storepb.LabelNam
 			var backendErr error
 			names, backendWarnings, backendErr = b.Client.LabelNames(ctx, matches, startTime, endTime)
 			if backendErr != nil {
+				level.Error(qs.logger).Log("msg", "backend LabelNames query failed", "backend", b.Name, "matches", fmt.Sprint(matches), "err", backendErr)
 				return nil, status.Error(codes.Internal, backendErr.Error())
 			}
 			qs.labelNamesCache.Put(b.Name, matches, startTime, endTime, names, backendWarnings)
@@ -252,6 +264,7 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 
 			matched, backendWarnings, err := qs.hasMatchingSeries(ctx, b, selector, matches, start, end)
 			if err != nil {
+				level.Error(qs.logger).Log("msg", "backend hasMatchingSeries failed", "backend", b.Name, "selector", selector, "err", err)
 				return nil, status.Error(codes.Internal, err.Error())
 			}
 			warnings = append(warnings, backendWarnings...)
@@ -270,6 +283,7 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 			var backendErr error
 			req, backendWarnings, backendErr = b.Client.LabelValues(ctx, request.Label, matches, startTime, endTime)
 			if backendErr != nil {
+				level.Error(qs.logger).Log("msg", "backend LabelValues query failed", "backend", b.Name, "label", request.Label, "matches", fmt.Sprint(matches), "err", backendErr)
 				return nil, status.Error(codes.Internal, backendErr.Error())
 			}
 			qs.labelValuesCache.Put(b.Name, request.Label, matches, startTime, endTime, req, backendWarnings)
@@ -312,6 +326,7 @@ func (qs *QueryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryS
 
 		values, warnings, err := b.Client.Query(srv.Context(), query, ts, v1.WithTimeout(timeout))
 		if err != nil {
+			level.Error(qs.logger).Log("msg", "backend instant query failed", "backend", b.Name, "query", query, "err", err)
 			return status.Error(codes.Aborted, err.Error())
 		}
 		if len(warnings) > 0 {
@@ -373,6 +388,7 @@ func (qs *QueryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 
 		values, warnings, err := b.Client.QueryRange(srv.Context(), query, interval, v1.WithTimeout(timeout))
 		if err != nil {
+			level.Error(qs.logger).Log("msg", "backend range query failed", "backend", b.Name, "query", query, "err", err)
 			return status.Error(codes.Aborted, err.Error())
 		}
 		if len(warnings) > 0 {
