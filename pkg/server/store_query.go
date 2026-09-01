@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/go-kit/log"
@@ -15,6 +16,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/api/query/querypb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -86,10 +88,15 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 		return status.Error(codes.InvalidArgument, "max_time must be greater than or equal to min_time")
 	}
 
+	g, ctx := errgroup.WithContext(server.Context())
+	var mu sync.Mutex
 	matched := false
-	var sent int64
+	warningsSet := make(map[string]struct{})
+	var warnings v1.Warnings
 	seriesSet := make([]storepb.Series, 0)
+
 	for _, b := range qs.backends {
+		b := b
 		externalLabels := b.Labels()
 		match, matchers, err := promql.MatchesExternalLabels(request.Matchers, externalLabels)
 		if err != nil {
@@ -98,65 +105,86 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 		if !match {
 			continue
 		}
-		matched = true
 		if len(matchers) == 0 {
 			return status.Error(codes.InvalidArgument, "no matchers specified (excluding external labels)")
 		}
-		selector := promql.QuerySelectorFromPromMatchers(matchers)
 
-		if request.SkipChunks {
-			backendSeriesSet, warnings, err := qs.seriesMetadataFromBackend(server.Context(), b, externalLabels, request, selector, start, end)
-			if err != nil {
-				level.Error(qs.logger).Log("msg", "backend series metadata query failed", "backend", b.Name, "selector", selector, "err", err)
-				return status.Error(codes.Aborted, err.Error())
-			}
-			if err := promql.SendStoreWarnings(server, warnings); err != nil {
-				return err
-			}
-			seriesSet = append(seriesSet, backendSeriesSet...)
-			continue
-		}
+		g.Go(func() error {
+			selector := promql.QuerySelectorFromPromMatchers(matchers)
+			var bSeriesSet []storepb.Series
+			var bWarnings v1.Warnings
 
-		interval := v1.Range{
-			Start: start,
-			End:   end,
-			Step:  promql.SeriesStepForRange(request, qs.SeriesStep, start, end, qs.MaxPointsPerSeries),
-		}
-		values, warnings, err := b.Client.QueryRange(server.Context(), selector, interval)
-		if err != nil {
-			level.Error(qs.logger).Log("msg", "backend series query_range failed", "backend", b.Name, "selector", selector, "err", err)
-			return status.Error(codes.Aborted, err.Error())
-		}
-		if err := promql.SendStoreWarnings(server, warnings); err != nil {
-			return err
-		}
+			if request.SkipChunks {
+				var bErr error
+				bSeriesSet, bWarnings, bErr = qs.seriesMetadataFromBackend(ctx, b, externalLabels, request, selector, start, end)
+				if bErr != nil {
+					level.Error(qs.logger).Log("msg", "backend series metadata query failed", "backend", b.Name, "selector", selector, "err", bErr)
+					return status.Error(codes.Aborted, bErr.Error())
+				}
+			} else {
+				interval := v1.Range{
+					Start: start,
+					End:   end,
+					Step:  promql.SeriesStepForRange(request, qs.SeriesStep, start, end, qs.MaxPointsPerSeries),
+				}
+				values, w, bErr := b.Client.QueryRange(ctx, selector, interval)
+				bWarnings = w
+				if bErr != nil {
+					level.Error(qs.logger).Log("msg", "backend series query_range failed", "backend", b.Name, "selector", selector, "err", bErr)
+					return status.Error(codes.Aborted, bErr.Error())
+				}
 
-		matrix, ok := values.(model.Matrix)
-		if !ok {
-			err := fmt.Errorf("backend returned %T for series selector %q, want model.Matrix", values, selector)
-			level.Error(qs.logger).Log("msg", "unexpected response type for backend series query_range", "backend", b.Name, "selector", selector, "err", err)
-			return status.Error(codes.Internal, err.Error())
-		}
+				matrix, ok := values.(model.Matrix)
+				if !ok {
+					err := fmt.Errorf("backend returned %T for series selector %q, want model.Matrix", values, selector)
+					level.Error(qs.logger).Log("msg", "unexpected response type for backend series query_range", "backend", b.Name, "selector", selector, "err", err)
+					return status.Error(codes.Internal, err.Error())
+				}
 
-		for _, result := range matrix {
-			if result == nil || len(result.Values) == 0 {
-				continue
+				for _, result := range matrix {
+					if result == nil || len(result.Values) == 0 {
+						continue
+					}
+					chunks, err := promql.ChunksFromModelSamples(result.Values)
+					if err != nil {
+						return status.Error(codes.Internal, err.Error())
+					}
+					bSeriesSet = append(bSeriesSet, storepb.Series{
+						Labels: qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, request.WithoutReplicaLabels),
+						Chunks: chunks,
+					})
+				}
 			}
-			chunks, err := promql.ChunksFromModelSamples(result.Values)
-			if err != nil {
-				return status.Error(codes.Internal, err.Error())
+
+			mu.Lock()
+			matched = true
+			seriesSet = append(seriesSet, bSeriesSet...)
+			for _, w := range bWarnings {
+				if _, ok := warningsSet[w]; !ok {
+					warningsSet[w] = struct{}{}
+					warnings = append(warnings, w)
+				}
 			}
-			seriesSet = append(seriesSet, storepb.Series{
-				Labels: qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, request.WithoutReplicaLabels),
-				Chunks: chunks,
-			})
-		}
+			mu.Unlock()
+			return nil
+		})
 	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
 	if !matched {
 		return nil
 	}
+
+	if err := promql.SendStoreWarnings(server, warnings); err != nil {
+		return err
+	}
+
 	promql.SortStoreSeries(seriesSet)
 
+	var sent int64
 	for i := range seriesSet {
 		if err := server.Send(storepb.NewSeriesResponse(&seriesSet[i])); err != nil {
 			return err
@@ -185,10 +213,14 @@ func (qs *QueryServer) seriesMetadataFromBackend(ctx context.Context, b backend.
 }
 
 func (qs *QueryServer) LabelNames(ctx context.Context, request *storepb.LabelNamesRequest) (*storepb.LabelNamesResponse, error) {
+	g, ctx := errgroup.WithContext(ctx)
+	var mu sync.Mutex
 	nameSet := make(map[string]struct{})
 	var warnings v1.Warnings
+	warningsSet := make(map[string]struct{})
 
 	for _, b := range qs.backends {
+		b := b
 		externalLabels := b.Labels()
 		match, promMatchers, err := promql.MatchesExternalLabels(request.Matchers, externalLabels)
 		if err != nil {
@@ -202,20 +234,37 @@ func (qs *QueryServer) LabelNames(ctx context.Context, request *storepb.LabelNam
 		startTime := promql.TimeFromMillis(request.Start)
 		endTime := promql.TimeFromMillis(request.End)
 
-		names, backendWarnings, cached := qs.labelNamesCache.Get(b.Name, matches, startTime, endTime)
-		if !cached {
-			var backendErr error
-			names, backendWarnings, backendErr = b.Client.LabelNames(ctx, matches, startTime, endTime)
-			if backendErr != nil {
-				level.Error(qs.logger).Log("msg", "backend LabelNames query failed", "backend", b.Name, "matches", fmt.Sprint(matches), "err", backendErr)
-				return nil, status.Error(codes.Internal, backendErr.Error())
+		g.Go(func() error {
+			names, backendWarnings, cached := qs.labelNamesCache.Get(b.Name, matches, startTime, endTime)
+			if !cached {
+				var backendErr error
+				names, backendWarnings, backendErr = b.Client.LabelNames(ctx, matches, startTime, endTime)
+				if backendErr != nil {
+					level.Error(qs.logger).Log("msg", "backend LabelNames query failed", "backend", b.Name, "matches", fmt.Sprint(matches), "err", backendErr)
+					return status.Error(codes.Internal, backendErr.Error())
+				}
+				qs.labelNamesCache.Put(b.Name, matches, startTime, endTime, names, backendWarnings)
 			}
-			qs.labelNamesCache.Put(b.Name, matches, startTime, endTime, names, backendWarnings)
-		}
-		warnings = append(warnings, backendWarnings...)
-		for _, name := range qs.dropLabels.LabelNames(names, externalLabels, request.WithoutReplicaLabels) {
-			nameSet[name] = struct{}{}
-		}
+
+			droppedNames := qs.dropLabels.LabelNames(names, externalLabels, request.WithoutReplicaLabels)
+
+			mu.Lock()
+			for _, name := range droppedNames {
+				nameSet[name] = struct{}{}
+			}
+			for _, w := range backendWarnings {
+				if _, ok := warningsSet[w]; !ok {
+					warningsSet[w] = struct{}{}
+					warnings = append(warnings, w)
+				}
+			}
+			mu.Unlock()
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 
 	names := make([]string, 0, len(nameSet))
@@ -238,10 +287,14 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 		return &storepb.LabelValuesResponse{}, nil
 	}
 
+	g, ctx := errgroup.WithContext(ctx)
+	var mu sync.Mutex
 	valueSet := make(map[string]struct{})
 	var warnings v1.Warnings
+	warningsSet := make(map[string]struct{})
 
 	for _, b := range qs.backends {
+		b := b
 		externalLabels := b.Labels()
 		match, promMatchers, err := promql.MatchesExternalLabels(request.Matchers, externalLabels)
 		if err != nil {
@@ -251,47 +304,72 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 			continue
 		}
 
-		if value := externalLabels.Get(request.Label); value != "" {
-			if len(promMatchers) == 0 {
-				valueSet[value] = struct{}{}
-				continue
+		g.Go(func() error {
+			if value := externalLabels.Get(request.Label); value != "" {
+				if len(promMatchers) == 0 {
+					mu.Lock()
+					valueSet[value] = struct{}{}
+					mu.Unlock()
+					return nil
+				}
+
+				matches := promql.LabelAPISelectorsFromPromMatchers(promMatchers)
+				selector := promql.QuerySelectorFromPromMatchers(promMatchers)
+				start := promql.TimeFromMillis(request.Start)
+				end := promql.TimeFromMillis(request.End)
+
+				matched, backendWarnings, err := qs.hasMatchingSeries(ctx, b, selector, matches, start, end)
+				if err != nil {
+					level.Error(qs.logger).Log("msg", "backend hasMatchingSeries failed", "backend", b.Name, "selector", selector, "err", err)
+					return status.Error(codes.Internal, err.Error())
+				}
+
+				mu.Lock()
+				if matched {
+					valueSet[value] = struct{}{}
+				}
+				for _, w := range backendWarnings {
+					if _, ok := warningsSet[w]; !ok {
+						warningsSet[w] = struct{}{}
+						warnings = append(warnings, w)
+					}
+				}
+				mu.Unlock()
+				return nil
 			}
 
 			matches := promql.LabelAPISelectorsFromPromMatchers(promMatchers)
-			selector := promql.QuerySelectorFromPromMatchers(promMatchers)
-			start := promql.TimeFromMillis(request.Start)
-			end := promql.TimeFromMillis(request.End)
+			startTime := promql.TimeFromMillis(request.Start)
+			endTime := promql.TimeFromMillis(request.End)
 
-			matched, backendWarnings, err := qs.hasMatchingSeries(ctx, b, selector, matches, start, end)
-			if err != nil {
-				level.Error(qs.logger).Log("msg", "backend hasMatchingSeries failed", "backend", b.Name, "selector", selector, "err", err)
-				return nil, status.Error(codes.Internal, err.Error())
+			req, backendWarnings, cached := qs.labelValuesCache.Get(b.Name, request.Label, matches, startTime, endTime)
+			if !cached {
+				var backendErr error
+				req, backendWarnings, backendErr = b.Client.LabelValues(ctx, request.Label, matches, startTime, endTime)
+				if backendErr != nil {
+					level.Error(qs.logger).Log("msg", "backend LabelValues query failed", "backend", b.Name, "label", request.Label, "matches", fmt.Sprint(matches), "err", backendErr)
+					return status.Error(codes.Internal, backendErr.Error())
+				}
+				qs.labelValuesCache.Put(b.Name, request.Label, matches, startTime, endTime, req, backendWarnings)
 			}
-			warnings = append(warnings, backendWarnings...)
-			if matched {
-				valueSet[value] = struct{}{}
-			}
-			continue
-		}
 
-		matches := promql.LabelAPISelectorsFromPromMatchers(promMatchers)
-		startTime := promql.TimeFromMillis(request.Start)
-		endTime := promql.TimeFromMillis(request.End)
-
-		req, backendWarnings, cached := qs.labelValuesCache.Get(b.Name, request.Label, matches, startTime, endTime)
-		if !cached {
-			var backendErr error
-			req, backendWarnings, backendErr = b.Client.LabelValues(ctx, request.Label, matches, startTime, endTime)
-			if backendErr != nil {
-				level.Error(qs.logger).Log("msg", "backend LabelValues query failed", "backend", b.Name, "label", request.Label, "matches", fmt.Sprint(matches), "err", backendErr)
-				return nil, status.Error(codes.Internal, backendErr.Error())
+			mu.Lock()
+			for _, value := range req {
+				valueSet[string(value)] = struct{}{}
 			}
-			qs.labelValuesCache.Put(b.Name, request.Label, matches, startTime, endTime, req, backendWarnings)
-		}
-		warnings = append(warnings, backendWarnings...)
-		for _, value := range req {
-			valueSet[string(value)] = struct{}{}
-		}
+			for _, w := range backendWarnings {
+				if _, ok := warningsSet[w]; !ok {
+					warningsSet[w] = struct{}{}
+					warnings = append(warnings, w)
+				}
+			}
+			mu.Unlock()
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 
 	values := make([]string, 0, len(valueSet))
@@ -314,7 +392,14 @@ func (qs *QueryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryS
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 
+	g, ctx := errgroup.WithContext(srv.Context())
+	var mu sync.Mutex
+	resultsSeries := make([]*prompb.TimeSeries, 0)
+	var warnings []string
+	warningsSet := make(map[string]struct{})
+
 	for _, b := range qs.backends {
+		b := b
 		externalLabels := b.Labels()
 		query, match, err := promql.RewriteQueryForExternalLabels(rawQuery, externalLabels)
 		if err != nil {
@@ -324,44 +409,66 @@ func (qs *QueryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryS
 			continue
 		}
 
-		values, warnings, err := b.Client.Query(srv.Context(), query, ts, v1.WithTimeout(timeout))
-		if err != nil {
-			level.Error(qs.logger).Log("msg", "backend instant query failed", "backend", b.Name, "query", query, "err", err)
-			return status.Error(codes.Aborted, err.Error())
+		g.Go(func() error {
+			values, w, err := b.Client.Query(ctx, query, ts, v1.WithTimeout(timeout))
+			if err != nil {
+				level.Error(qs.logger).Log("msg", "backend instant query failed", "backend", b.Name, "query", query, "err", err)
+				return status.Error(codes.Aborted, err.Error())
+			}
+
+			var bSeries []*prompb.TimeSeries
+			switch results := values.(type) {
+			case model.Vector:
+				for _, result := range results {
+					if result == nil {
+						continue
+					}
+					bSeries = append(bSeries, &prompb.TimeSeries{
+						Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
+						Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
+					})
+				}
+			case *model.Scalar:
+				if results != nil {
+					bSeries = append(bSeries, &prompb.TimeSeries{
+						Samples: []prompb.Sample{{Value: float64(results.Value), Timestamp: int64(results.Timestamp)}},
+					})
+				}
+			}
+
+			mu.Lock()
+			resultsSeries = append(resultsSeries, bSeries...)
+			for _, warn := range w {
+				if _, ok := warningsSet[warn]; !ok {
+					warningsSet[warn] = struct{}{}
+					warnings = append(warnings, warn)
+				}
+			}
+			mu.Unlock()
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	if len(warnings) > 0 {
+		errs := make([]error, 0, len(warnings))
+		for _, warning := range warnings {
+			errs = append(errs, errors.New(warning))
 		}
-		if len(warnings) > 0 {
-			errs := make([]error, 0, len(warnings))
-			for _, warning := range warnings {
-				errs = append(errs, errors.New(warning))
-			}
-			if err = srv.SendMsg(querypb.NewQueryWarningsResponse(errs...)); err != nil {
-				return err
-			}
-		}
-		switch results := values.(type) {
-		case model.Vector:
-			for _, result := range results {
-				if result == nil {
-					continue
-				}
-				series := &prompb.TimeSeries{
-					Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
-					Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
-				}
-				if err := srv.Send(querypb.NewQueryResponse(series)); err != nil {
-					return err
-				}
-			}
-		case *model.Scalar:
-			if results == nil {
-				continue
-			}
-			series := &prompb.TimeSeries{Samples: []prompb.Sample{{Value: float64(results.Value), Timestamp: int64(results.Timestamp)}}}
-			if err := srv.Send(querypb.NewQueryResponse(series)); err != nil {
-				return err
-			}
+		if err = srv.SendMsg(querypb.NewQueryWarningsResponse(errs...)); err != nil {
+			return err
 		}
 	}
+
+	for _, series := range resultsSeries {
+		if err := srv.Send(querypb.NewQueryResponse(series)); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -370,13 +477,21 @@ func (qs *QueryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 	interval := v1.Range{
 		Start: time.Unix(req.StartTimeSeconds, 0),
 		End:   time.Unix(req.EndTimeSeconds, 0),
-		Step:  time.Duration(req.IntervalSeconds) * time.Second}
+		Step:  time.Duration(req.IntervalSeconds) * time.Second,
+	}
 	rawQuery, err := promql.QueryStringFromRequestPlan(req.Query, req.QueryPlan)
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 
+	g, ctx := errgroup.WithContext(srv.Context())
+	var mu sync.Mutex
+	resultsSeries := make([]*prompb.TimeSeries, 0)
+	var warnings []string
+	warningsSet := make(map[string]struct{})
+
 	for _, b := range qs.backends {
+		b := b
 		externalLabels := b.Labels()
 		query, match, err := promql.RewriteQueryForExternalLabels(rawQuery, externalLabels)
 		if err != nil {
@@ -386,57 +501,76 @@ func (qs *QueryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 			continue
 		}
 
-		values, warnings, err := b.Client.QueryRange(srv.Context(), query, interval, v1.WithTimeout(timeout))
-		if err != nil {
-			level.Error(qs.logger).Log("msg", "backend range query failed", "backend", b.Name, "query", query, "err", err)
-			return status.Error(codes.Aborted, err.Error())
+		g.Go(func() error {
+			values, w, err := b.Client.QueryRange(ctx, query, interval, v1.WithTimeout(timeout))
+			if err != nil {
+				level.Error(qs.logger).Log("msg", "backend range query failed", "backend", b.Name, "query", query, "err", err)
+				return status.Error(codes.Aborted, err.Error())
+			}
+
+			var bSeries []*prompb.TimeSeries
+			switch results := values.(type) {
+			case model.Matrix:
+				for _, result := range results {
+					if result == nil || len(result.Values) == 0 {
+						continue
+					}
+					bSeries = append(bSeries, &prompb.TimeSeries{
+						Samples: promql.SamplesFromModel(result.Values),
+						Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
+					})
+				}
+			case model.Vector:
+				for _, result := range results {
+					if result == nil {
+						continue
+					}
+					bSeries = append(bSeries, &prompb.TimeSeries{
+						Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
+						Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
+					})
+				}
+			case *model.Scalar:
+				if results != nil {
+					bSeries = append(bSeries, &prompb.TimeSeries{
+						Samples: []prompb.Sample{{Value: float64(results.Value), Timestamp: int64(results.Timestamp)}},
+					})
+				}
+			}
+
+			mu.Lock()
+			resultsSeries = append(resultsSeries, bSeries...)
+			for _, warn := range w {
+				if _, ok := warningsSet[warn]; !ok {
+					warningsSet[warn] = struct{}{}
+					warnings = append(warnings, warn)
+				}
+			}
+			mu.Unlock()
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	if len(warnings) > 0 {
+		errs := make([]error, 0, len(warnings))
+		for _, warning := range warnings {
+			errs = append(errs, errors.New(warning))
 		}
-		if len(warnings) > 0 {
-			errs := make([]error, 0, len(warnings))
-			for _, warning := range warnings {
-				errs = append(errs, errors.New(warning))
-			}
-			if err = srv.SendMsg(querypb.NewQueryRangeWarningsResponse(errs...)); err != nil {
-				return err
-			}
-		}
-		switch results := values.(type) {
-		case model.Matrix:
-			for _, result := range results {
-				if result == nil || len(result.Values) == 0 {
-					continue
-				}
-				series := &prompb.TimeSeries{
-					Samples: promql.SamplesFromModel(result.Values),
-					Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
-				}
-				if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
-					return err
-				}
-			}
-		case model.Vector:
-			for _, result := range results {
-				if result == nil {
-					continue
-				}
-				series := &prompb.TimeSeries{
-					Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
-					Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
-				}
-				if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
-					return err
-				}
-			}
-		case *model.Scalar:
-			if results == nil {
-				continue
-			}
-			series := &prompb.TimeSeries{Samples: []prompb.Sample{{Value: float64(results.Value), Timestamp: int64(results.Timestamp)}}}
-			if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
-				return err
-			}
+		if err = srv.SendMsg(querypb.NewQueryRangeWarningsResponse(errs...)); err != nil {
+			return err
 		}
 	}
+
+	for _, series := range resultsSeries {
+		if err := srv.Send(querypb.NewQueryRangeResponse(series)); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
