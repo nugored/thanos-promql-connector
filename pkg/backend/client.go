@@ -84,6 +84,72 @@ func (rt *HeaderRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	return rt.base.RoundTrip(outgoing)
 }
 
+type RetryRoundTripper struct {
+	base       http.RoundTripper
+	maxRetries int
+}
+
+func NewRetryRoundTripper(base http.RoundTripper, maxRetries int) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	return &RetryRoundTripper{
+		base:       base,
+		maxRetries: maxRetries,
+	}
+}
+
+func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+
+	for attempt := 0; attempt <= rt.maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(100*(1<<attempt)) * time.Millisecond
+			select {
+			case <-req.Context().Done():
+				if resp != nil {
+					return resp, nil
+				}
+				return nil, req.Context().Err()
+			case <-time.After(backoff):
+			}
+
+			if req.GetBody != nil {
+				newBody, err := req.GetBody()
+				if err == nil {
+					req.Body = newBody
+				}
+			}
+		}
+
+		resp, err = rt.base.RoundTrip(req)
+		if err != nil {
+			if req.Context().Err() != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode == http.StatusBadGateway ||
+			resp.StatusCode == http.StatusServiceUnavailable ||
+			resp.StatusCode == http.StatusGatewayTimeout {
+			if attempt < rt.maxRetries {
+				resp.Body.Close()
+				continue
+			}
+		}
+
+		return resp, nil
+	}
+
+	return resp, err
+}
+
 func NewQueryBackendRoundTripper(queryConfig config.QueryBackendConfig) (http.RoundTripper, error) {
 	transport := http.RoundTripper(http.DefaultTransport)
 	if QueryAuthEnabled(queryConfig.Auth) {
@@ -100,7 +166,8 @@ func NewQueryBackendRoundTripper(queryConfig config.QueryBackendConfig) (http.Ro
 		transport = client.Transport
 	}
 
-	return NewHeaderRoundTripper(transport, queryConfig.Headers), nil
+	transport = NewHeaderRoundTripper(transport, queryConfig.Headers)
+	return NewRetryRoundTripper(transport, 3), nil
 }
 
 func QueryAuthEnabled(auth config.QueryBackendAuthConfig) bool {

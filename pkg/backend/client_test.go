@@ -13,8 +13,12 @@ func TestNewQueryBackendRoundTripperSkipsGoogleAuthWhenAuthEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQueryBackendRoundTripper() returned error: %v", err)
 	}
-	if rt != http.DefaultTransport {
-		t.Fatalf("NewQueryBackendRoundTripper() = %T, want http.DefaultTransport", rt)
+	retryRT, ok := rt.(*RetryRoundTripper)
+	if !ok {
+		t.Fatalf("NewQueryBackendRoundTripper() = %T, want *RetryRoundTripper", rt)
+	}
+	if retryRT.base != http.DefaultTransport {
+		t.Fatalf("RetryRoundTripper base = %T, want http.DefaultTransport", retryRT.base)
 	}
 }
 
@@ -26,9 +30,13 @@ func TestNewQueryBackendRoundTripperKeepsHeadersWithoutAuth(t *testing.T) {
 		t.Fatalf("NewQueryBackendRoundTripper() returned error: %v", err)
 	}
 
-	headerRT, ok := rt.(*HeaderRoundTripper)
+	retryRT, ok := rt.(*RetryRoundTripper)
 	if !ok {
-		t.Fatalf("NewQueryBackendRoundTripper() = %T, want *HeaderRoundTripper", rt)
+		t.Fatalf("NewQueryBackendRoundTripper() = %T, want *RetryRoundTripper", rt)
+	}
+	headerRT, ok := retryRT.base.(*HeaderRoundTripper)
+	if !ok {
+		t.Fatalf("RetryRoundTripper base = %T, want *HeaderRoundTripper", retryRT.base)
 	}
 	if headerRT.base != http.DefaultTransport {
 		t.Fatalf("header round tripper base = %T, want http.DefaultTransport", headerRT.base)
@@ -74,5 +82,37 @@ func TestGoogleAuthScopes(t *testing.T) {
 				t.Fatalf("GoogleAuthScopes() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+type fakeRoundTripper struct {
+	attempts  int
+	responses []*http.Response
+}
+
+func (f *fakeRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp := f.responses[f.attempts]
+	f.attempts++
+	return resp, nil
+}
+
+func TestRetryRoundTripperRetries429ThenSucceeds(t *testing.T) {
+	fake := &fakeRoundTripper{
+		responses: []*http.Response{
+			{StatusCode: http.StatusTooManyRequests, Body: http.NoBody},
+			{StatusCode: http.StatusOK, Body: http.NoBody},
+		},
+	}
+	rt := NewRetryRoundTripper(fake, 3)
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip() error = %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want 200", resp.StatusCode)
+	}
+	if fake.attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", fake.attempts)
 	}
 }

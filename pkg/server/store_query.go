@@ -16,7 +16,6 @@ import (
 	"github.com/thanos-io/thanos/pkg/api/query/querypb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -88,12 +87,14 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 		return status.Error(codes.InvalidArgument, "max_time must be greater than or equal to min_time")
 	}
 
-	g, ctx := errgroup.WithContext(server.Context())
+	var wg sync.WaitGroup
 	var mu sync.Mutex
 	matched := false
 	warningsSet := make(map[string]struct{})
 	var warnings v1.Warnings
 	seriesSet := make([]storepb.Series, 0)
+	var lastErr error
+	successCount := 0
 
 	for _, b := range qs.backends {
 		b := b
@@ -109,17 +110,27 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 			return status.Error(codes.InvalidArgument, "no matchers specified (excluding external labels)")
 		}
 
-		g.Go(func() error {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			selector := promql.QuerySelectorFromPromMatchers(matchers)
 			var bSeriesSet []storepb.Series
 			var bWarnings v1.Warnings
 
 			if request.SkipChunks {
 				var bErr error
-				bSeriesSet, bWarnings, bErr = qs.seriesMetadataFromBackend(ctx, b, externalLabels, request, selector, start, end)
+				bSeriesSet, bWarnings, bErr = qs.seriesMetadataFromBackend(server.Context(), b, externalLabels, request, selector, start, end)
 				if bErr != nil {
 					level.Error(qs.logger).Log("msg", "backend series metadata query failed", "backend", b.Name, "selector", selector, "err", bErr)
-					return status.Error(codes.Aborted, bErr.Error())
+					mu.Lock()
+					lastErr = status.Error(codes.Aborted, bErr.Error())
+					wStr := fmt.Sprintf("backend %s series metadata query failed: %v", b.Name, bErr)
+					if _, ok := warningsSet[wStr]; !ok {
+						warningsSet[wStr] = struct{}{}
+						warnings = append(warnings, wStr)
+					}
+					mu.Unlock()
+					return
 				}
 			} else {
 				interval := v1.Range{
@@ -127,18 +138,34 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 					End:   end,
 					Step:  promql.SeriesStepForRange(request, qs.SeriesStep, start, end, qs.MaxPointsPerSeries),
 				}
-				values, w, bErr := b.Client.QueryRange(ctx, selector, interval)
+				values, w, bErr := b.Client.QueryRange(server.Context(), selector, interval)
 				bWarnings = w
 				if bErr != nil {
 					level.Error(qs.logger).Log("msg", "backend series query_range failed", "backend", b.Name, "selector", selector, "err", bErr)
-					return status.Error(codes.Aborted, bErr.Error())
+					mu.Lock()
+					lastErr = status.Error(codes.Aborted, bErr.Error())
+					wStr := fmt.Sprintf("backend %s series query_range failed: %v", b.Name, bErr)
+					if _, ok := warningsSet[wStr]; !ok {
+						warningsSet[wStr] = struct{}{}
+						warnings = append(warnings, wStr)
+					}
+					mu.Unlock()
+					return
 				}
 
 				matrix, ok := values.(model.Matrix)
 				if !ok {
 					err := fmt.Errorf("backend returned %T for series selector %q, want model.Matrix", values, selector)
 					level.Error(qs.logger).Log("msg", "unexpected response type for backend series query_range", "backend", b.Name, "selector", selector, "err", err)
-					return status.Error(codes.Internal, err.Error())
+					mu.Lock()
+					lastErr = status.Error(codes.Internal, err.Error())
+					wStr := fmt.Sprintf("backend %s series query_range invalid response: %v", b.Name, err)
+					if _, ok := warningsSet[wStr]; !ok {
+						warningsSet[wStr] = struct{}{}
+						warnings = append(warnings, wStr)
+					}
+					mu.Unlock()
+					return
 				}
 
 				for _, result := range matrix {
@@ -147,7 +174,10 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 					}
 					chunks, err := promql.ChunksFromModelSamples(result.Values)
 					if err != nil {
-						return status.Error(codes.Internal, err.Error())
+						mu.Lock()
+						lastErr = status.Error(codes.Internal, err.Error())
+						mu.Unlock()
+						return
 					}
 					bSeriesSet = append(bSeriesSet, storepb.Series{
 						Labels: qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, request.WithoutReplicaLabels),
@@ -158,6 +188,7 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 
 			mu.Lock()
 			matched = true
+			successCount++
 			seriesSet = append(seriesSet, bSeriesSet...)
 			for _, w := range bWarnings {
 				if _, ok := warningsSet[w]; !ok {
@@ -166,16 +197,17 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 				}
 			}
 			mu.Unlock()
-			return nil
-		})
+		}()
 	}
 
-	if err := g.Wait(); err != nil {
-		return err
-	}
+	wg.Wait()
 
 	if !matched {
 		return nil
+	}
+
+	if successCount == 0 && lastErr != nil {
+		return lastErr
 	}
 
 	if err := promql.SendStoreWarnings(server, warnings); err != nil {
@@ -213,11 +245,14 @@ func (qs *QueryServer) seriesMetadataFromBackend(ctx context.Context, b backend.
 }
 
 func (qs *QueryServer) LabelNames(ctx context.Context, request *storepb.LabelNamesRequest) (*storepb.LabelNamesResponse, error) {
-	g, ctx := errgroup.WithContext(ctx)
+	var wg sync.WaitGroup
 	var mu sync.Mutex
 	nameSet := make(map[string]struct{})
 	var warnings v1.Warnings
 	warningsSet := make(map[string]struct{})
+	var lastErr error
+	successCount := 0
+	matchedBackends := 0
 
 	for _, b := range qs.backends {
 		b := b
@@ -229,19 +264,30 @@ func (qs *QueryServer) LabelNames(ctx context.Context, request *storepb.LabelNam
 		if !match {
 			continue
 		}
+		matchedBackends++
 
 		matches := promql.LabelAPISelectorsFromPromMatchers(promMatchers)
 		startTime := promql.TimeFromMillis(request.Start)
 		endTime := promql.TimeFromMillis(request.End)
 
-		g.Go(func() error {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			names, backendWarnings, cached := qs.labelNamesCache.Get(b.Name, matches, startTime, endTime)
 			if !cached {
 				var backendErr error
 				names, backendWarnings, backendErr = b.Client.LabelNames(ctx, matches, startTime, endTime)
 				if backendErr != nil {
 					level.Error(qs.logger).Log("msg", "backend LabelNames query failed", "backend", b.Name, "matches", fmt.Sprint(matches), "err", backendErr)
-					return status.Error(codes.Internal, backendErr.Error())
+					mu.Lock()
+					lastErr = status.Error(codes.Internal, backendErr.Error())
+					wStr := fmt.Sprintf("backend %s LabelNames query failed: %v", b.Name, backendErr)
+					if _, ok := warningsSet[wStr]; !ok {
+						warningsSet[wStr] = struct{}{}
+						warnings = append(warnings, wStr)
+					}
+					mu.Unlock()
+					return
 				}
 				qs.labelNamesCache.Put(b.Name, matches, startTime, endTime, names, backendWarnings)
 			}
@@ -249,6 +295,7 @@ func (qs *QueryServer) LabelNames(ctx context.Context, request *storepb.LabelNam
 			droppedNames := qs.dropLabels.LabelNames(names, externalLabels, request.WithoutReplicaLabels)
 
 			mu.Lock()
+			successCount++
 			for _, name := range droppedNames {
 				nameSet[name] = struct{}{}
 			}
@@ -259,12 +306,13 @@ func (qs *QueryServer) LabelNames(ctx context.Context, request *storepb.LabelNam
 				}
 			}
 			mu.Unlock()
-			return nil
-		})
+		}()
 	}
 
-	if err := g.Wait(); err != nil {
-		return nil, err
+	wg.Wait()
+
+	if matchedBackends > 0 && successCount == 0 && lastErr != nil {
+		return nil, lastErr
 	}
 
 	names := make([]string, 0, len(nameSet))
@@ -287,11 +335,14 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 		return &storepb.LabelValuesResponse{}, nil
 	}
 
-	g, ctx := errgroup.WithContext(ctx)
+	var wg sync.WaitGroup
 	var mu sync.Mutex
 	valueSet := make(map[string]struct{})
 	var warnings v1.Warnings
 	warningsSet := make(map[string]struct{})
+	var lastErr error
+	successCount := 0
+	matchedBackends := 0
 
 	for _, b := range qs.backends {
 		b := b
@@ -303,14 +354,18 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 		if !match {
 			continue
 		}
+		matchedBackends++
 
-		g.Go(func() error {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			if value := externalLabels.Get(request.Label); value != "" {
 				if len(promMatchers) == 0 {
 					mu.Lock()
 					valueSet[value] = struct{}{}
+					successCount++
 					mu.Unlock()
-					return nil
+					return
 				}
 
 				matches := promql.LabelAPISelectorsFromPromMatchers(promMatchers)
@@ -321,10 +376,19 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 				matched, backendWarnings, err := qs.hasMatchingSeries(ctx, b, selector, matches, start, end)
 				if err != nil {
 					level.Error(qs.logger).Log("msg", "backend hasMatchingSeries failed", "backend", b.Name, "selector", selector, "err", err)
-					return status.Error(codes.Internal, err.Error())
+					mu.Lock()
+					lastErr = status.Error(codes.Internal, err.Error())
+					wStr := fmt.Sprintf("backend %s hasMatchingSeries failed: %v", b.Name, err)
+					if _, ok := warningsSet[wStr]; !ok {
+						warningsSet[wStr] = struct{}{}
+						warnings = append(warnings, wStr)
+					}
+					mu.Unlock()
+					return
 				}
 
 				mu.Lock()
+				successCount++
 				if matched {
 					valueSet[value] = struct{}{}
 				}
@@ -335,7 +399,7 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 					}
 				}
 				mu.Unlock()
-				return nil
+				return
 			}
 
 			matches := promql.LabelAPISelectorsFromPromMatchers(promMatchers)
@@ -348,12 +412,21 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 				req, backendWarnings, backendErr = b.Client.LabelValues(ctx, request.Label, matches, startTime, endTime)
 				if backendErr != nil {
 					level.Error(qs.logger).Log("msg", "backend LabelValues query failed", "backend", b.Name, "label", request.Label, "matches", fmt.Sprint(matches), "err", backendErr)
-					return status.Error(codes.Internal, backendErr.Error())
+					mu.Lock()
+					lastErr = status.Error(codes.Internal, backendErr.Error())
+					wStr := fmt.Sprintf("backend %s LabelValues query failed: %v", b.Name, backendErr)
+					if _, ok := warningsSet[wStr]; !ok {
+						warningsSet[wStr] = struct{}{}
+						warnings = append(warnings, wStr)
+					}
+					mu.Unlock()
+					return
 				}
 				qs.labelValuesCache.Put(b.Name, request.Label, matches, startTime, endTime, req, backendWarnings)
 			}
 
 			mu.Lock()
+			successCount++
 			for _, value := range req {
 				valueSet[string(value)] = struct{}{}
 			}
@@ -364,12 +437,13 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 				}
 			}
 			mu.Unlock()
-			return nil
-		})
+		}()
 	}
 
-	if err := g.Wait(); err != nil {
-		return nil, err
+	wg.Wait()
+
+	if matchedBackends > 0 && successCount == 0 && lastErr != nil {
+		return nil, lastErr
 	}
 
 	values := make([]string, 0, len(valueSet))
@@ -392,11 +466,14 @@ func (qs *QueryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryS
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	g, ctx := errgroup.WithContext(srv.Context())
+	var wg sync.WaitGroup
 	var mu sync.Mutex
 	resultsSeries := make([]*prompb.TimeSeries, 0)
 	var warnings []string
 	warningsSet := make(map[string]struct{})
+	var lastErr error
+	successCount := 0
+	matchedBackends := 0
 
 	for _, b := range qs.backends {
 		b := b
@@ -408,12 +485,23 @@ func (qs *QueryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryS
 		if !match {
 			continue
 		}
+		matchedBackends++
 
-		g.Go(func() error {
-			values, w, err := b.Client.Query(ctx, query, ts, v1.WithTimeout(timeout))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			values, w, err := b.Client.Query(srv.Context(), query, ts, v1.WithTimeout(timeout))
 			if err != nil {
 				level.Error(qs.logger).Log("msg", "backend instant query failed", "backend", b.Name, "query", query, "err", err)
-				return status.Error(codes.Aborted, err.Error())
+				mu.Lock()
+				lastErr = status.Error(codes.Aborted, err.Error())
+				wStr := fmt.Sprintf("backend %s instant query failed: %v", b.Name, err)
+				if _, ok := warningsSet[wStr]; !ok {
+					warningsSet[wStr] = struct{}{}
+					warnings = append(warnings, wStr)
+				}
+				mu.Unlock()
+				return
 			}
 
 			var bSeries []*prompb.TimeSeries
@@ -437,6 +525,7 @@ func (qs *QueryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryS
 			}
 
 			mu.Lock()
+			successCount++
 			resultsSeries = append(resultsSeries, bSeries...)
 			for _, warn := range w {
 				if _, ok := warningsSet[warn]; !ok {
@@ -445,12 +534,13 @@ func (qs *QueryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryS
 				}
 			}
 			mu.Unlock()
-			return nil
-		})
+		}()
 	}
 
-	if err := g.Wait(); err != nil {
-		return err
+	wg.Wait()
+
+	if matchedBackends > 0 && successCount == 0 && lastErr != nil {
+		return lastErr
 	}
 
 	if len(warnings) > 0 {
@@ -484,11 +574,14 @@ func (qs *QueryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	g, ctx := errgroup.WithContext(srv.Context())
+	var wg sync.WaitGroup
 	var mu sync.Mutex
 	resultsSeries := make([]*prompb.TimeSeries, 0)
 	var warnings []string
 	warningsSet := make(map[string]struct{})
+	var lastErr error
+	successCount := 0
+	matchedBackends := 0
 
 	for _, b := range qs.backends {
 		b := b
@@ -500,12 +593,23 @@ func (qs *QueryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 		if !match {
 			continue
 		}
+		matchedBackends++
 
-		g.Go(func() error {
-			values, w, err := b.Client.QueryRange(ctx, query, interval, v1.WithTimeout(timeout))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			values, w, err := b.Client.QueryRange(srv.Context(), query, interval, v1.WithTimeout(timeout))
 			if err != nil {
 				level.Error(qs.logger).Log("msg", "backend range query failed", "backend", b.Name, "query", query, "err", err)
-				return status.Error(codes.Aborted, err.Error())
+				mu.Lock()
+				lastErr = status.Error(codes.Aborted, err.Error())
+				wStr := fmt.Sprintf("backend %s range query failed: %v", b.Name, err)
+				if _, ok := warningsSet[wStr]; !ok {
+					warningsSet[wStr] = struct{}{}
+					warnings = append(warnings, wStr)
+				}
+				mu.Unlock()
+				return
 			}
 
 			var bSeries []*prompb.TimeSeries
@@ -539,6 +643,7 @@ func (qs *QueryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 			}
 
 			mu.Lock()
+			successCount++
 			resultsSeries = append(resultsSeries, bSeries...)
 			for _, warn := range w {
 				if _, ok := warningsSet[warn]; !ok {
@@ -547,12 +652,13 @@ func (qs *QueryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 				}
 			}
 			mu.Unlock()
-			return nil
-		})
+		}()
 	}
 
-	if err := g.Wait(); err != nil {
-		return err
+	wg.Wait()
+
+	if matchedBackends > 0 && successCount == 0 && lastErr != nil {
+		return lastErr
 	}
 
 	if len(warnings) > 0 {

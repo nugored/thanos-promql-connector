@@ -1185,3 +1185,42 @@ func TestQueryLogsBackendError(t *testing.T) {
 		t.Errorf("log output missing error text, got %q", logOutput)
 	}
 }
+
+func TestQueryPartialSuccessWithWarnings(t *testing.T) {
+	server := NewQueryServerFromBackends(
+		nil,
+		[]backend.QueryBackendEndpoint{
+			{
+				Name: "failing-backend",
+				Client: fakeQueryBackendAPI{
+					err: errors.New("429 Too Many Requests"),
+				},
+			},
+			{
+				Name: "working-backend",
+				Client: fakeQueryBackendAPI{
+					queryValue: model.Vector{
+						&model.Sample{Metric: model.Metric{"__name__": "up"}, Value: 1, Timestamp: 1000},
+					},
+				},
+			},
+		},
+		nil,
+		time.Minute,
+		11000,
+		5*time.Minute,
+	)
+
+	stream := &fakeQueryServerStream{}
+	err := server.Query(&querypb.QueryRequest{
+		TimeSeconds: 1000,
+		Query:       "up",
+	}, stream)
+
+	if err != nil {
+		t.Fatalf("Query() expected success with partial backend failure, got err: %v", err)
+	}
+	if len(stream.responses) != 1 {
+		t.Fatalf("responses count = %d, want 1", len(stream.responses))
+	}
+}
