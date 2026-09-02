@@ -283,14 +283,14 @@ func (qs *QueryServer) LabelNames(ctx context.Context, request *storepb.LabelNam
 				var backendErr error
 				names, backendWarnings, backendErr = b.Client.LabelNames(ctx, matches, startTime, endTime)
 				if backendErr != nil {
-					level.Error(qs.logger).Log("msg", "backend LabelNames query failed", "backend", b.Name, "matches", fmt.Sprint(matches), "err", backendErr)
+					level.Warn(qs.logger).Log("msg", "backend LabelNames query returned error, returning empty names", "backend", b.Name, "matches", fmt.Sprint(matches), "err", backendErr)
 					mu.Lock()
-					lastErr = status.Error(codes.Internal, backendErr.Error())
 					wStr := fmt.Sprintf("backend %s LabelNames query failed: %v", b.Name, backendErr)
 					if _, ok := warningsSet[wStr]; !ok {
 						warningsSet[wStr] = struct{}{}
 						warnings = append(warnings, wStr)
 					}
+					successCount++
 					mu.Unlock()
 					return
 				}
@@ -380,14 +380,14 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 
 				matched, backendWarnings, err := qs.hasMatchingSeries(ctx, b, selector, matches, start, end)
 				if err != nil {
-					level.Error(qs.logger).Log("msg", "backend hasMatchingSeries failed", "backend", b.Name, "selector", selector, "err", err)
+					level.Warn(qs.logger).Log("msg", "backend hasMatchingSeries failed, returning empty values", "backend", b.Name, "selector", selector, "err", err)
 					mu.Lock()
-					lastErr = status.Error(codes.Internal, err.Error())
 					wStr := fmt.Sprintf("backend %s hasMatchingSeries failed: %v", b.Name, err)
 					if _, ok := warningsSet[wStr]; !ok {
 						warningsSet[wStr] = struct{}{}
 						warnings = append(warnings, wStr)
 					}
+					successCount++
 					mu.Unlock()
 					return
 				}
@@ -416,14 +416,14 @@ func (qs *QueryServer) LabelValues(ctx context.Context, request *storepb.LabelVa
 				var backendErr error
 				req, backendWarnings, backendErr = b.Client.LabelValues(ctx, request.Label, matches, startTime, endTime)
 				if backendErr != nil {
-					level.Error(qs.logger).Log("msg", "backend LabelValues query failed", "backend", b.Name, "label", request.Label, "matches", fmt.Sprint(matches), "err", backendErr)
+					level.Warn(qs.logger).Log("msg", "backend LabelValues query failed, returning empty values", "backend", b.Name, "label", request.Label, "matches", fmt.Sprint(matches), "err", backendErr)
 					mu.Lock()
-					lastErr = status.Error(codes.Internal, backendErr.Error())
 					wStr := fmt.Sprintf("backend %s LabelValues query failed: %v", b.Name, backendErr)
 					if _, ok := warningsSet[wStr]; !ok {
 						warningsSet[wStr] = struct{}{}
 						warnings = append(warnings, wStr)
 					}
+					successCount++
 					mu.Unlock()
 					return
 				}
