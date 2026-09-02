@@ -10,7 +10,7 @@ import (
 
 func LabelAPISelectorsFromMatchers(matchers []storepb.LabelMatcher) ([]string, error) {
 	if len(matchers) == 0 {
-		return nil, nil
+		return []string{`{__name__=~".+"}`}, nil
 	}
 	selector, err := QuerySelectorFromMatchers(matchers)
 	if err != nil {
@@ -21,7 +21,7 @@ func LabelAPISelectorsFromMatchers(matchers []storepb.LabelMatcher) ([]string, e
 
 func LabelAPISelectorsFromPromMatchers(matchers []*labels.Matcher) []string {
 	if len(matchers) == 0 {
-		return nil
+		return []string{`{__name__=~".+"}`}
 	}
 	return []string{QuerySelectorFromPromMatchers(matchers)}
 }

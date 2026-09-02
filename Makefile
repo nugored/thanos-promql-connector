@@ -1,5 +1,5 @@
 IMAGE ?= santadepapaya/thanos-promql-connector
-TAG ?= 0.0.21-paralel2
+TAG ?= 0.0.21-paralel3
 PLATFORM ?= linux/amd64
 DOCKER ?= docker
 GO_TAGS ?= slicelabels

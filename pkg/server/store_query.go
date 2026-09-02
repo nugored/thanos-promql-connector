@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -232,6 +233,10 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 func (qs *QueryServer) seriesMetadataFromBackend(ctx context.Context, b backend.QueryBackendEndpoint, externalLabels labels.Labels, request *storepb.SeriesRequest, selector string, start, end time.Time) ([]storepb.Series, v1.Warnings, error) {
 	labelSets, warnings, err := b.Client.Series(ctx, []string{selector}, start, end)
 	if err != nil {
+		if strings.Contains(err.Error(), "bad_data") || strings.Contains(err.Error(), "400") {
+			level.Warn(qs.logger).Log("msg", "backend series metadata query returned bad_data, returning empty series set", "backend", b.Name, "selector", selector, "err", err)
+			return nil, v1.Warnings{fmt.Sprintf("backend %s series metadata query returned bad_data: %v", b.Name, err)}, nil
+		}
 		return nil, nil, err
 	}
 
