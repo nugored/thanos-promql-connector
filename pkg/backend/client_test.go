@@ -17,8 +17,12 @@ func TestNewQueryBackendRoundTripperSkipsGoogleAuthWhenAuthEmpty(t *testing.T) {
 	if !ok {
 		t.Fatalf("NewQueryBackendRoundTripper() = %T, want *RetryRoundTripper", rt)
 	}
-	if retryRT.base != http.DefaultTransport {
-		t.Fatalf("RetryRoundTripper base = %T, want http.DefaultTransport", retryRT.base)
+	rateLimiterRT, ok := retryRT.base.(*RateLimiterRoundTripper)
+	if !ok {
+		t.Fatalf("RetryRoundTripper base = %T, want *RateLimiterRoundTripper", retryRT.base)
+	}
+	if rateLimiterRT.base != http.DefaultTransport {
+		t.Fatalf("RateLimiterRoundTripper base = %T, want http.DefaultTransport", rateLimiterRT.base)
 	}
 }
 
@@ -34,9 +38,13 @@ func TestNewQueryBackendRoundTripperKeepsHeadersWithoutAuth(t *testing.T) {
 	if !ok {
 		t.Fatalf("NewQueryBackendRoundTripper() = %T, want *RetryRoundTripper", rt)
 	}
-	headerRT, ok := retryRT.base.(*HeaderRoundTripper)
+	rateLimiterRT, ok := retryRT.base.(*RateLimiterRoundTripper)
 	if !ok {
-		t.Fatalf("RetryRoundTripper base = %T, want *HeaderRoundTripper", retryRT.base)
+		t.Fatalf("RetryRoundTripper base = %T, want *RateLimiterRoundTripper", retryRT.base)
+	}
+	headerRT, ok := rateLimiterRT.base.(*HeaderRoundTripper)
+	if !ok {
+		t.Fatalf("RateLimiterRoundTripper base = %T, want *HeaderRoundTripper", rateLimiterRT.base)
 	}
 	if headerRT.base != http.DefaultTransport {
 		t.Fatalf("header round tripper base = %T, want http.DefaultTransport", headerRT.base)
@@ -114,5 +122,22 @@ func TestRetryRoundTripperRetries429ThenSucceeds(t *testing.T) {
 	}
 	if fake.attempts != 2 {
 		t.Fatalf("attempts = %d, want 2", fake.attempts)
+	}
+}
+
+func TestRateLimiterRoundTripper(t *testing.T) {
+	fake := &fakeRoundTripper{
+		responses: []*http.Response{
+			{StatusCode: http.StatusOK, Body: http.NoBody},
+		},
+	}
+	rt := NewRateLimiterRoundTripper(fake, 10, 10, 2)
+	req, _ := http.NewRequest("GET", "http://example.com", nil)
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip() error = %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("StatusCode = %d, want 200", resp.StatusCode)
 	}
 }

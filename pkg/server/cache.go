@@ -21,18 +21,20 @@ type labelMatchCacheEntry struct {
 }
 
 type labelMatchCache struct {
-	mtx     sync.RWMutex
-	ttl     time.Duration
-	entries map[labelMatchCacheKey]labelMatchCacheEntry
+	mtx        sync.RWMutex
+	ttl        time.Duration
+	maxEntries int
+	entries    map[labelMatchCacheKey]labelMatchCacheEntry
 }
 
-func newLabelMatchCache(ttl time.Duration) *labelMatchCache {
+func newLabelMatchCache(ttl time.Duration, maxEntries int) *labelMatchCache {
 	if ttl <= 0 {
 		return nil
 	}
 	return &labelMatchCache{
-		ttl:     ttl,
-		entries: make(map[labelMatchCacheKey]labelMatchCacheEntry),
+		ttl:        ttl,
+		maxEntries: maxEntries,
+		entries:    make(map[labelMatchCacheKey]labelMatchCacheEntry),
 	}
 }
 
@@ -52,16 +54,60 @@ func (c *labelMatchCache) Get(backend, selector string) (bool, bool) {
 	return entry.matched, true
 }
 
+func (c *labelMatchCache) PurgeExpired() {
+	if c == nil {
+		return
+	}
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.purgeExpiredLocked()
+}
+
+func (c *labelMatchCache) purgeExpiredLocked() {
+	now := time.Now()
+	for k, v := range c.entries {
+		if now.After(v.expiresAt) {
+			delete(c.entries, k)
+		}
+	}
+}
+
+func (c *labelMatchCache) evictOldestLocked() {
+	if len(c.entries) == 0 {
+		return
+	}
+	var oldestKey labelMatchCacheKey
+	var oldestTime time.Time
+	first := true
+	for k, v := range c.entries {
+		if first || v.expiresAt.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = v.expiresAt
+			first = false
+		}
+	}
+	delete(c.entries, oldestKey)
+}
+
 func (c *labelMatchCache) Put(backend, selector string, matched bool) {
 	if c == nil {
 		return
 	}
 	c.mtx.Lock()
-	c.entries[labelMatchCacheKey{backend: backend, selector: selector}] = labelMatchCacheEntry{
+	defer c.mtx.Unlock()
+
+	key := labelMatchCacheKey{backend: backend, selector: selector}
+	if _, exists := c.entries[key]; !exists && c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
+		c.purgeExpiredLocked()
+		if len(c.entries) >= c.maxEntries {
+			c.evictOldestLocked()
+		}
+	}
+
+	c.entries[key] = labelMatchCacheEntry{
 		matched:   matched,
 		expiresAt: time.Now().Add(c.ttl),
 	}
-	c.mtx.Unlock()
 }
 
 type labelNamesCacheKey struct {
@@ -78,18 +124,20 @@ type labelNamesCacheEntry struct {
 }
 
 type labelNamesCache struct {
-	mtx     sync.RWMutex
-	ttl     time.Duration
-	entries map[labelNamesCacheKey]labelNamesCacheEntry
+	mtx        sync.RWMutex
+	ttl        time.Duration
+	maxEntries int
+	entries    map[labelNamesCacheKey]labelNamesCacheEntry
 }
 
-func newLabelNamesCache(ttl time.Duration) *labelNamesCache {
+func newLabelNamesCache(ttl time.Duration, maxEntries int) *labelNamesCache {
 	if ttl <= 0 {
 		return nil
 	}
 	return &labelNamesCache{
-		ttl:     ttl,
-		entries: make(map[labelNamesCacheKey]labelNamesCacheEntry),
+		ttl:        ttl,
+		maxEntries: maxEntries,
+		entries:    make(map[labelNamesCacheKey]labelNamesCacheEntry),
 	}
 }
 
@@ -115,6 +163,41 @@ func (c *labelNamesCache) Get(backend string, matches []string, startTime, endTi
 	return cloneStringSlice(entry.names), cloneWarningsSlice(entry.warnings), true
 }
 
+func (c *labelNamesCache) PurgeExpired() {
+	if c == nil {
+		return
+	}
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.purgeExpiredLocked()
+}
+
+func (c *labelNamesCache) purgeExpiredLocked() {
+	now := time.Now()
+	for k, v := range c.entries {
+		if now.After(v.expiresAt) {
+			delete(c.entries, k)
+		}
+	}
+}
+
+func (c *labelNamesCache) evictOldestLocked() {
+	if len(c.entries) == 0 {
+		return
+	}
+	var oldestKey labelNamesCacheKey
+	var oldestTime time.Time
+	first := true
+	for k, v := range c.entries {
+		if first || v.expiresAt.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = v.expiresAt
+			first = false
+		}
+	}
+	delete(c.entries, oldestKey)
+}
+
 func (c *labelNamesCache) Put(backend string, matches []string, startTime, endTime time.Time, names []string, warnings v1.Warnings) {
 	if c == nil {
 		return
@@ -126,12 +209,20 @@ func (c *labelNamesCache) Put(backend string, matches []string, startTime, endTi
 		endBucket:   bucketTimeMs(endTime),
 	}
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	if _, exists := c.entries[key]; !exists && c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
+		c.purgeExpiredLocked()
+		if len(c.entries) >= c.maxEntries {
+			c.evictOldestLocked()
+		}
+	}
+
 	c.entries[key] = labelNamesCacheEntry{
 		names:     cloneStringSlice(names),
 		warnings:  cloneWarningsSlice(warnings),
 		expiresAt: time.Now().Add(c.ttl),
 	}
-	c.mtx.Unlock()
 }
 
 type labelValuesCacheKey struct {
@@ -149,18 +240,20 @@ type labelValuesCacheEntry struct {
 }
 
 type labelValuesCache struct {
-	mtx     sync.RWMutex
-	ttl     time.Duration
-	entries map[labelValuesCacheKey]labelValuesCacheEntry
+	mtx        sync.RWMutex
+	ttl        time.Duration
+	maxEntries int
+	entries    map[labelValuesCacheKey]labelValuesCacheEntry
 }
 
-func newLabelValuesCache(ttl time.Duration) *labelValuesCache {
+func newLabelValuesCache(ttl time.Duration, maxEntries int) *labelValuesCache {
 	if ttl <= 0 {
 		return nil
 	}
 	return &labelValuesCache{
-		ttl:     ttl,
-		entries: make(map[labelValuesCacheKey]labelValuesCacheEntry),
+		ttl:        ttl,
+		maxEntries: maxEntries,
+		entries:    make(map[labelValuesCacheKey]labelValuesCacheEntry),
 	}
 }
 
@@ -187,6 +280,41 @@ func (c *labelValuesCache) Get(backend, label string, matches []string, startTim
 	return cloneLabelValuesSlice(entry.values), cloneWarningsSlice(entry.warnings), true
 }
 
+func (c *labelValuesCache) PurgeExpired() {
+	if c == nil {
+		return
+	}
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.purgeExpiredLocked()
+}
+
+func (c *labelValuesCache) purgeExpiredLocked() {
+	now := time.Now()
+	for k, v := range c.entries {
+		if now.After(v.expiresAt) {
+			delete(c.entries, k)
+		}
+	}
+}
+
+func (c *labelValuesCache) evictOldestLocked() {
+	if len(c.entries) == 0 {
+		return
+	}
+	var oldestKey labelValuesCacheKey
+	var oldestTime time.Time
+	first := true
+	for k, v := range c.entries {
+		if first || v.expiresAt.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = v.expiresAt
+			first = false
+		}
+	}
+	delete(c.entries, oldestKey)
+}
+
 func (c *labelValuesCache) Put(backend, label string, matches []string, startTime, endTime time.Time, values model.LabelValues, warnings v1.Warnings) {
 	if c == nil {
 		return
@@ -199,12 +327,20 @@ func (c *labelValuesCache) Put(backend, label string, matches []string, startTim
 		endBucket:   bucketTimeMs(endTime),
 	}
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	if _, exists := c.entries[key]; !exists && c.maxEntries > 0 && len(c.entries) >= c.maxEntries {
+		c.purgeExpiredLocked()
+		if len(c.entries) >= c.maxEntries {
+			c.evictOldestLocked()
+		}
+	}
+
 	c.entries[key] = labelValuesCacheEntry{
 		values:    cloneLabelValuesSlice(values),
 		warnings:  cloneWarningsSlice(warnings),
 		expiresAt: time.Now().Add(c.ttl),
 	}
-	c.mtx.Unlock()
 }
 
 func bucketTimeMs(t time.Time) int64 {

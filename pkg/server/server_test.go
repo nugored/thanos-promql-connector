@@ -1224,3 +1224,40 @@ func TestQueryPartialSuccessWithWarnings(t *testing.T) {
 		t.Fatalf("responses count = %d, want 1", len(stream.responses))
 	}
 }
+
+func TestCacheEvictionAndPurge(t *testing.T) {
+	labelNamesCalls := make([]fakeLabelNamesCall, 0, 5)
+	server := NewQueryServerWithCacheConfig(
+		nil,
+		[]backend.QueryBackendEndpoint{{
+			Name: "backend",
+			Client: fakeQueryBackendAPI{
+				labelNames:      []string{"app", "job"},
+				labelNamesCalls: &labelNamesCalls,
+			},
+		}},
+		nil,
+		time.Minute,
+		11000,
+		50*time.Millisecond, 50*time.Millisecond, 50*time.Millisecond,
+		2, 2, 2,
+	)
+
+	req1 := &storepb.LabelNamesRequest{Start: 60000, End: 120000}
+	_, _ = server.LabelNames(context.Background(), req1)
+
+	req2 := &storepb.LabelNamesRequest{Start: 180000, End: 240000}
+	_, _ = server.LabelNames(context.Background(), req2)
+
+	// Wait for entries to expire
+	time.Sleep(100 * time.Millisecond)
+
+	// Purge expired entries
+	server.PurgeExpiredCaches()
+
+	// Should call backend again after purge
+	_, _ = server.LabelNames(context.Background(), req1)
+	if len(labelNamesCalls) != 3 {
+		t.Fatalf("labelNamesCalls after purge = %d, want 3", len(labelNamesCalls))
+	}
+}

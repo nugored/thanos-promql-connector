@@ -47,7 +47,7 @@ func NewQueryServerFromBackends(logger log.Logger, backends []backend.QueryBacke
 	return NewQueryServerWithCacheTTLs(logger, backends, dropLabels, seriesStep, maxPointsPerSeries, labelCacheTTL, labelCacheTTL, labelCacheTTL)
 }
 
-func NewQueryServerWithCacheTTLs(logger log.Logger, backends []backend.QueryBackendEndpoint, dropLabels []string, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL, labelNamesCacheTTL, labelValuesCacheTTL time.Duration) *QueryServer {
+func NewQueryServerWithCacheConfig(logger log.Logger, backends []backend.QueryBackendEndpoint, dropLabels []string, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL, labelNamesCacheTTL, labelValuesCacheTTL time.Duration, labelCacheMaxEntries, labelNamesCacheMaxEntries, labelValuesCacheMaxEntries int) *QueryServer {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -75,10 +75,23 @@ func NewQueryServerWithCacheTTLs(logger log.Logger, backends []backend.QueryBack
 		dropLabels:         promql.NewLabelDropSet(dropLabels),
 		SeriesStep:         seriesStep,
 		MaxPointsPerSeries: maxPointsPerSeries,
-		labelCache:         newLabelMatchCache(labelCacheTTL),
-		labelNamesCache:    newLabelNamesCache(labelNamesCacheTTL),
-		labelValuesCache:   newLabelValuesCache(labelValuesCacheTTL),
+		labelCache:         newLabelMatchCache(labelCacheTTL, labelCacheMaxEntries),
+		labelNamesCache:    newLabelNamesCache(labelNamesCacheTTL, labelNamesCacheMaxEntries),
+		labelValuesCache:   newLabelValuesCache(labelValuesCacheTTL, labelValuesCacheMaxEntries),
 	}
+}
+
+func NewQueryServerWithCacheTTLs(logger log.Logger, backends []backend.QueryBackendEndpoint, dropLabels []string, seriesStep time.Duration, maxPointsPerSeries int, labelCacheTTL, labelNamesCacheTTL, labelValuesCacheTTL time.Duration) *QueryServer {
+	return NewQueryServerWithCacheConfig(logger, backends, dropLabels, seriesStep, maxPointsPerSeries, labelCacheTTL, labelNamesCacheTTL, labelValuesCacheTTL, 10000, 10000, 10000)
+}
+
+func (qs *QueryServer) PurgeExpiredCaches() {
+	if qs == nil {
+		return
+	}
+	qs.labelCache.PurgeExpired()
+	qs.labelNamesCache.PurgeExpired()
+	qs.labelValuesCache.PurgeExpired()
 }
 
 func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Store_SeriesServer) error {
