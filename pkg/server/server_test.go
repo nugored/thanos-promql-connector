@@ -1261,3 +1261,78 @@ func TestCacheEvictionAndPurge(t *testing.T) {
 		t.Fatalf("labelNamesCalls after purge = %d, want 3", len(labelNamesCalls))
 	}
 }
+
+func TestQueryServerNativeHistograms(t *testing.T) {
+	nativeHistSample := &model.SampleHistogram{
+		Count: model.FloatString(10),
+		Sum:   model.FloatString(20),
+		Buckets: model.HistogramBuckets{
+			{Boundaries: 0, Lower: model.FloatString(1), Upper: model.FloatString(2), Count: model.FloatString(10)},
+		},
+	}
+
+	fakeAPI := fakeQueryBackendAPI{
+		queryValue: model.Vector{
+			&model.Sample{
+				Metric:    model.Metric{"__name__": "my_custom_test_histogram"},
+				Timestamp: 1000,
+				Histogram: nativeHistSample,
+			},
+		},
+		queryRangeValue: model.Matrix{
+			&model.SampleStream{
+				Metric: model.Metric{"__name__": "my_custom_test_histogram"},
+				Histograms: []model.SampleHistogramPair{
+					{Timestamp: 1000, Histogram: nativeHistSample},
+				},
+			},
+		},
+	}
+
+	server := NewQueryServer(nil, fakeAPI, nil, nil, time.Minute, 11000, time.Minute)
+
+	// Test Instant Query
+	queryStream := &fakeQueryServerStream{}
+	err := server.Query(&querypb.QueryRequest{Query: "my_custom_test_histogram", TimeSeconds: 1}, queryStream)
+	if err != nil {
+		t.Fatalf("Query() returned error: %v", err)
+	}
+	if len(queryStream.responses) != 1 {
+		t.Fatalf("Query() response count = %d, want 1", len(queryStream.responses))
+	}
+	if len(queryStream.responses[0].GetTimeseries().Histograms) != 1 {
+		t.Fatalf("Query() response histograms count = %d, want 1", len(queryStream.responses[0].GetTimeseries().Histograms))
+	}
+
+	// Test Range Query
+	rangeStream := &fakeQueryRangeServerStream{}
+	err = server.QueryRange(&querypb.QueryRangeRequest{Query: "my_custom_test_histogram", StartTimeSeconds: 1, EndTimeSeconds: 2}, rangeStream)
+	if err != nil {
+		t.Fatalf("QueryRange() returned error: %v", err)
+	}
+	if len(rangeStream.responses) != 1 {
+		t.Fatalf("QueryRange() response count = %d, want 1", len(rangeStream.responses))
+	}
+	if len(rangeStream.responses[0].GetTimeseries().Histograms) != 1 {
+		t.Fatalf("QueryRange() response histograms count = %d, want 1", len(rangeStream.responses[0].GetTimeseries().Histograms))
+	}
+
+	// Test Series (StoreAPI)
+	storeStream := &fakeStoreSeriesServer{}
+	err = server.Series(&storepb.SeriesRequest{
+		MinTime: 1000, MaxTime: 2000,
+		Matchers: []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "my_custom_test_histogram"}},
+	}, storeStream)
+	if err != nil {
+		t.Fatalf("Series() returned error: %v", err)
+	}
+	if len(storeStream.responses) != 1 {
+		t.Fatalf("Series() response count = %d, want 1", len(storeStream.responses))
+	}
+	if len(storeStream.responses[0].GetSeries().Chunks) != 1 {
+		t.Fatalf("Series() chunks count = %d, want 1", len(storeStream.responses[0].GetSeries().Chunks))
+	}
+	if storeStream.responses[0].GetSeries().Chunks[0].Raw.Type != storepb.Chunk_FLOAT_HISTOGRAM {
+		t.Fatalf("Series() chunk type = %s, want FLOAT_HISTOGRAM", storeStream.responses[0].GetSeries().Chunks[0].Raw.Type)
+	}
+}

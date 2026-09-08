@@ -323,3 +323,68 @@ func TestExternalLabelsOverrideResultLabels(t *testing.T) {
 		t.Fatalf("ZLabelsFromMetric() = %v, want %v", labelMap, want)
 	}
 }
+
+func TestSampleHistogramToFloatHistogram(t *testing.T) {
+	sh := &model.SampleHistogram{
+		Count: model.FloatString(10),
+		Sum:   model.FloatString(25.5),
+		Buckets: model.HistogramBuckets{
+			{Boundaries: 3, Lower: model.FloatString(-0.1), Upper: model.FloatString(0.1), Count: model.FloatString(2)},
+			{Boundaries: 0, Lower: model.FloatString(1), Upper: model.FloatString(2), Count: model.FloatString(5)},
+			{Boundaries: 0, Lower: model.FloatString(2), Upper: model.FloatString(4), Count: model.FloatString(3)},
+		},
+	}
+
+	fh := SampleHistogramToFloatHistogram(sh)
+	if fh == nil {
+		t.Fatal("SampleHistogramToFloatHistogram() returned nil")
+	}
+
+	if fh.Count != 10 {
+		t.Fatalf("fh.Count = %f, want 10", fh.Count)
+	}
+	if fh.Sum != 25.5 {
+		t.Fatalf("fh.Sum = %f, want 25.5", fh.Sum)
+	}
+	if fh.ZeroCount != 2 {
+		t.Fatalf("fh.ZeroCount = %f, want 2", fh.ZeroCount)
+	}
+	if fh.ZeroThreshold != 0.1 {
+		t.Fatalf("fh.ZeroThreshold = %f, want 0.1", fh.ZeroThreshold)
+	}
+	if len(fh.PositiveBuckets) != 2 {
+		t.Fatalf("len(fh.PositiveBuckets) = %d, want 2", len(fh.PositiveBuckets))
+	}
+}
+
+func TestChunksFromModelHistogramSamples(t *testing.T) {
+	shPair := model.SampleHistogramPair{
+		Timestamp: 1000,
+		Histogram: &model.SampleHistogram{
+			Count: model.FloatString(5),
+			Sum:   model.FloatString(10),
+			Buckets: model.HistogramBuckets{
+				{Boundaries: 0, Lower: model.FloatString(1), Upper: model.FloatString(2), Count: model.FloatString(5)},
+			},
+		},
+	}
+
+	chunks, err := ChunksFromModelHistogramSamples([]model.SampleHistogramPair{shPair})
+	if err != nil {
+		t.Fatalf("ChunksFromModelHistogramSamples() returned error: %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("len(chunks) = %d, want 1", len(chunks))
+	}
+
+	chunk := chunks[0]
+	if chunk.MinTime != 1000 || chunk.MaxTime != 1000 {
+		t.Fatalf("chunk time range = [%d,%d], want [1000,1000]", chunk.MinTime, chunk.MaxTime)
+	}
+	if chunk.Raw == nil {
+		t.Fatal("chunk.Raw is nil")
+	}
+	if chunk.Raw.Type != storepb.Chunk_FLOAT_HISTOGRAM {
+		t.Fatalf("chunk.Raw.Type = %s, want FLOAT_HISTOGRAM", chunk.Raw.Type)
+	}
+}

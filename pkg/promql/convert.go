@@ -3,11 +3,13 @@ package promql
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
@@ -184,4 +186,200 @@ func ContainsString(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+type indexedBucket struct {
+	index int32
+	count float64
+}
+
+func SampleHistogramToFloatHistogram(sh *model.SampleHistogram) *histogram.FloatHistogram {
+	if sh == nil {
+		return nil
+	}
+
+	fh := &histogram.FloatHistogram{
+		Count: float64(sh.Count),
+		Sum:   float64(sh.Sum),
+	}
+
+	var posBuckets []indexedBucket
+	var negBuckets []indexedBucket
+	var schema int32 = 0
+	schemaDetected := false
+
+	for _, b := range sh.Buckets {
+		if b == nil {
+			continue
+		}
+		cnt := float64(b.Count)
+		lower := float64(b.Lower)
+		upper := float64(b.Upper)
+
+		if b.Boundaries == 3 {
+			// Zero bucket
+			fh.ZeroCount = cnt
+			if upper > 0 {
+				fh.ZeroThreshold = upper
+			} else if lower < 0 {
+				fh.ZeroThreshold = -lower
+			}
+			continue
+		}
+
+		if cnt <= 0 {
+			continue
+		}
+
+		if !schemaDetected && lower > 0 && upper > lower {
+			ratio := upper / lower
+			if ratio > 1 {
+				log2Ratio := math.Log2(ratio)
+				if log2Ratio > 0 {
+					n := math.Round(-math.Log2(log2Ratio))
+					if n >= -4 && n <= 8 {
+						schema = int32(n)
+						schemaDetected = true
+					}
+				}
+			}
+		}
+
+		if lower >= 0 {
+			var idx int32
+			if lower > 0 {
+				idx = int32(math.Round(math.Log2(lower) * math.Pow(2, float64(schema))))
+			}
+			posBuckets = append(posBuckets, indexedBucket{index: idx, count: cnt})
+		} else if upper <= 0 {
+			var idx int32
+			if upper < 0 {
+				idx = int32(math.Round(math.Log2(-upper) * math.Pow(2, float64(schema))))
+			}
+			negBuckets = append(negBuckets, indexedBucket{index: idx, count: cnt})
+		}
+	}
+
+	fh.Schema = schema
+	fh.PositiveSpans, fh.PositiveBuckets = buildSpansAndBuckets(posBuckets)
+	fh.NegativeSpans, fh.NegativeBuckets = buildSpansAndBuckets(negBuckets)
+
+	return fh
+}
+
+func buildSpansAndBuckets(buckets []indexedBucket) ([]histogram.Span, []float64) {
+	if len(buckets) == 0 {
+		return nil, nil
+	}
+
+	sort.Slice(buckets, func(i, j int) bool {
+		return buckets[i].index < buckets[j].index
+	})
+
+	var spans []histogram.Span
+	var counts []float64
+
+	var currentSpan *histogram.Span
+	var prevIndex int32
+
+	for i, b := range buckets {
+		counts = append(counts, b.count)
+		if i == 0 {
+			spans = append(spans, histogram.Span{
+				Offset: b.index,
+				Length: 1,
+			})
+			currentSpan = &spans[len(spans)-1]
+			prevIndex = b.index
+		} else if b.index == prevIndex+1 {
+			currentSpan.Length++
+			prevIndex = b.index
+		} else {
+			offset := b.index - (prevIndex + 1)
+			spans = append(spans, histogram.Span{
+				Offset: offset,
+				Length: 1,
+			})
+			currentSpan = &spans[len(spans)-1]
+			prevIndex = b.index
+		}
+	}
+
+	return spans, counts
+}
+
+func SampleHistogramPairToProto(hp model.SampleHistogramPair) prompb.Histogram {
+	fh := SampleHistogramToFloatHistogram(hp.Histogram)
+	if fh == nil {
+		return prompb.Histogram{}
+	}
+	ts := int64(hp.Timestamp)
+	return prompb.FloatHistogramToHistogramProto(ts, fh)
+}
+
+func SampleHistogramToProto(s *model.Sample) prompb.Histogram {
+	if s == nil || s.Histogram == nil {
+		return prompb.Histogram{}
+	}
+	fh := SampleHistogramToFloatHistogram(s.Histogram)
+	if fh == nil {
+		return prompb.Histogram{}
+	}
+	ts := int64(s.Timestamp)
+	return prompb.FloatHistogramToHistogramProto(ts, fh)
+}
+
+func ChunksFromModelHistogramSamples(samples []model.SampleHistogramPair) ([]storepb.AggrChunk, error) {
+	if len(samples) == 0 {
+		return nil, nil
+	}
+
+	const samplesPerChunk = 120
+	chunks := make([]storepb.AggrChunk, 0, (len(samples)+samplesPerChunk-1)/samplesPerChunk)
+	for i := 0; i < len(samples); i += samplesPerChunk {
+		end := i + samplesPerChunk
+		if end > len(samples) {
+			end = len(samples)
+		}
+		chunk, err := chunkFromModelHistogramSamples(samples[i:end])
+		if err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks, nil
+}
+
+func chunkFromModelHistogramSamples(samples []model.SampleHistogramPair) (storepb.AggrChunk, error) {
+	fhChunk := chunkenc.NewFloatHistogramChunk()
+	appender, err := fhChunk.Appender()
+	if err != nil {
+		return storepb.AggrChunk{}, fmt.Errorf("creating FloatHistogram chunk appender: %w", err)
+	}
+
+	minTime := int64(samples[0].Timestamp)
+	maxTime := minTime
+	for _, sample := range samples {
+		timestamp := int64(sample.Timestamp)
+		fh := SampleHistogramToFloatHistogram(sample.Histogram)
+		if fh != nil {
+			appender.AppendFloatHistogram(nil, timestamp, fh, false)
+		}
+		if timestamp < minTime {
+			minTime = timestamp
+		}
+		if timestamp > maxTime {
+			maxTime = timestamp
+		}
+	}
+	fhChunk.Compact()
+
+	return storepb.AggrChunk{
+		MinTime: minTime,
+		MaxTime: maxTime,
+		Raw: &storepb.Chunk{
+			Type: storepb.Chunk_FLOAT_HISTOGRAM,
+			Data: fhChunk.Bytes(),
+		},
+	}, nil
 }

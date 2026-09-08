@@ -183,10 +183,18 @@ func (qs *QueryServer) Series(request *storepb.SeriesRequest, server storepb.Sto
 				}
 
 				for _, result := range matrix {
-					if result == nil || len(result.Values) == 0 {
+					if result == nil {
 						continue
 					}
-					chunks, err := promql.ChunksFromModelSamples(result.Values)
+					var chunks []storepb.AggrChunk
+					var err error
+					if len(result.Histograms) > 0 {
+						chunks, err = promql.ChunksFromModelHistogramSamples(result.Histograms)
+					} else if len(result.Values) > 0 {
+						chunks, err = promql.ChunksFromModelSamples(result.Values)
+					} else {
+						continue
+					}
 					if err != nil {
 						mu.Lock()
 						lastErr = status.Error(codes.Internal, err.Error())
@@ -529,10 +537,17 @@ func (qs *QueryServer) Query(req *querypb.QueryRequest, srv querypb.Query_QueryS
 					if result == nil {
 						continue
 					}
-					bSeries = append(bSeries, &prompb.TimeSeries{
-						Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
-						Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
-					})
+					if result.Histogram != nil {
+						bSeries = append(bSeries, &prompb.TimeSeries{
+							Histograms: []prompb.Histogram{promql.SampleHistogramToProto(result)},
+							Labels:     qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
+						})
+					} else {
+						bSeries = append(bSeries, &prompb.TimeSeries{
+							Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
+							Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
+						})
+					}
 				}
 			case *model.Scalar:
 				if results != nil {
@@ -634,23 +649,41 @@ func (qs *QueryServer) QueryRange(req *querypb.QueryRangeRequest, srv querypb.Qu
 			switch results := values.(type) {
 			case model.Matrix:
 				for _, result := range results {
-					if result == nil || len(result.Values) == 0 {
+					if result == nil {
 						continue
 					}
-					bSeries = append(bSeries, &prompb.TimeSeries{
-						Samples: promql.SamplesFromModel(result.Values),
-						Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
-					})
+					if len(result.Histograms) > 0 {
+						histograms := make([]prompb.Histogram, 0, len(result.Histograms))
+						for _, h := range result.Histograms {
+							histograms = append(histograms, promql.SampleHistogramPairToProto(h))
+						}
+						bSeries = append(bSeries, &prompb.TimeSeries{
+							Histograms: histograms,
+							Labels:     qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
+						})
+					} else if len(result.Values) > 0 {
+						bSeries = append(bSeries, &prompb.TimeSeries{
+							Samples: promql.SamplesFromModel(result.Values),
+							Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
+						})
+					}
 				}
 			case model.Vector:
 				for _, result := range results {
 					if result == nil {
 						continue
 					}
-					bSeries = append(bSeries, &prompb.TimeSeries{
-						Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
-						Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
-					})
+					if result.Histogram != nil {
+						bSeries = append(bSeries, &prompb.TimeSeries{
+							Histograms: []prompb.Histogram{promql.SampleHistogramToProto(result)},
+							Labels:     qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
+						})
+					} else {
+						bSeries = append(bSeries, &prompb.TimeSeries{
+							Samples: []prompb.Sample{{Value: float64(result.Value), Timestamp: int64(result.Timestamp)}},
+							Labels:  qs.dropLabels.ZLabelsFromMetric(result.Metric, externalLabels, nil),
+						})
+					}
 				}
 			case *model.Scalar:
 				if results != nil {
