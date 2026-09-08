@@ -1271,6 +1271,14 @@ func TestQueryServerNativeHistograms(t *testing.T) {
 		},
 	}
 
+	histPairs := make([]model.SampleHistogramPair, 0, 10)
+	for i := 0; i < 10; i++ {
+		histPairs = append(histPairs, model.SampleHistogramPair{
+			Timestamp: model.Time(1000 + i*60000),
+			Histogram: nativeHistSample,
+		})
+	}
+
 	fakeAPI := fakeQueryBackendAPI{
 		queryValue: model.Vector{
 			&model.Sample{
@@ -1281,10 +1289,8 @@ func TestQueryServerNativeHistograms(t *testing.T) {
 		},
 		queryRangeValue: model.Matrix{
 			&model.SampleStream{
-				Metric: model.Metric{"__name__": "my_custom_test_histogram"},
-				Histograms: []model.SampleHistogramPair{
-					{Timestamp: 1000, Histogram: nativeHistSample},
-				},
+				Metric:     model.Metric{"__name__": "my_custom_test_histogram"},
+				Histograms: histPairs,
 			},
 		},
 	}
@@ -1313,8 +1319,8 @@ func TestQueryServerNativeHistograms(t *testing.T) {
 	if len(rangeStream.responses) != 1 {
 		t.Fatalf("QueryRange() response count = %d, want 1", len(rangeStream.responses))
 	}
-	if len(rangeStream.responses[0].GetTimeseries().Histograms) != 1 {
-		t.Fatalf("QueryRange() response histograms count = %d, want 1", len(rangeStream.responses[0].GetTimeseries().Histograms))
+	if len(rangeStream.responses[0].GetTimeseries().Histograms) != 10 {
+		t.Fatalf("QueryRange() response histograms count = %d, want 10", len(rangeStream.responses[0].GetTimeseries().Histograms))
 	}
 
 	// Test Series (StoreAPI)

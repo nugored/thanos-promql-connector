@@ -203,11 +203,39 @@ func SampleHistogramToFloatHistogram(sh *model.SampleHistogram) *histogram.Float
 		Sum:   float64(sh.Sum),
 	}
 
+	var schema int32 = 0
+
+	// Pass 1: Detect schema before processing any bucket indices
+	for _, b := range sh.Buckets {
+		if b == nil || b.Boundaries == 3 {
+			continue
+		}
+		lower := float64(b.Lower)
+		upper := float64(b.Upper)
+
+		var ratio float64
+		if lower > 0 && upper > lower {
+			ratio = upper / lower
+		} else if upper < 0 && lower < upper {
+			ratio = lower / upper
+		}
+
+		if ratio > 1 {
+			log2Ratio := math.Log2(ratio)
+			if log2Ratio > 0 {
+				n := math.Round(-math.Log2(log2Ratio))
+				if n >= -4 && n <= 8 {
+					schema = int32(n)
+					break
+				}
+			}
+		}
+	}
+
 	var posBuckets []indexedBucket
 	var negBuckets []indexedBucket
-	var schema int32 = 0
-	schemaDetected := false
 
+	// Pass 2: Calculate bucket indices using the detected schema
 	for _, b := range sh.Buckets {
 		if b == nil {
 			continue
@@ -229,20 +257,6 @@ func SampleHistogramToFloatHistogram(sh *model.SampleHistogram) *histogram.Float
 
 		if cnt <= 0 {
 			continue
-		}
-
-		if !schemaDetected && lower > 0 && upper > lower {
-			ratio := upper / lower
-			if ratio > 1 {
-				log2Ratio := math.Log2(ratio)
-				if log2Ratio > 0 {
-					n := math.Round(-math.Log2(log2Ratio))
-					if n >= -4 && n <= 8 {
-						schema = int32(n)
-						schemaDetected = true
-					}
-				}
-			}
 		}
 
 		if lower >= 0 {
@@ -334,52 +348,81 @@ func ChunksFromModelHistogramSamples(samples []model.SampleHistogramPair) ([]sto
 		return nil, nil
 	}
 
-	const samplesPerChunk = 120
-	chunks := make([]storepb.AggrChunk, 0, (len(samples)+samplesPerChunk-1)/samplesPerChunk)
-	for i := 0; i < len(samples); i += samplesPerChunk {
-		end := i + samplesPerChunk
-		if end > len(samples) {
-			end = len(samples)
-		}
-		chunk, err := chunkFromModelHistogramSamples(samples[i:end])
+	var chunks []storepb.AggrChunk
+
+	var currentChunk *chunkenc.FloatHistogramChunk
+	var appender chunkenc.Appender
+	var minTime, maxTime int64
+
+	startNewChunk := func(t int64) error {
+		currentChunk = chunkenc.NewFloatHistogramChunk()
+		app, err := currentChunk.Appender()
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("creating FloatHistogram chunk appender: %w", err)
 		}
-		chunks = append(chunks, chunk)
-	}
-	return chunks, nil
-}
-
-func chunkFromModelHistogramSamples(samples []model.SampleHistogramPair) (storepb.AggrChunk, error) {
-	fhChunk := chunkenc.NewFloatHistogramChunk()
-	appender, err := fhChunk.Appender()
-	if err != nil {
-		return storepb.AggrChunk{}, fmt.Errorf("creating FloatHistogram chunk appender: %w", err)
+		appender = app
+		minTime = t
+		maxTime = t
+		return nil
 	}
 
-	minTime := int64(samples[0].Timestamp)
-	maxTime := minTime
+	if err := startNewChunk(int64(samples[0].Timestamp)); err != nil {
+		return nil, err
+	}
+
 	for _, sample := range samples {
 		timestamp := int64(sample.Timestamp)
 		fh := SampleHistogramToFloatHistogram(sample.Histogram)
-		if fh != nil {
-			appender.AppendFloatHistogram(nil, timestamp, fh, false)
+		if fh == nil {
+			continue
 		}
-		if timestamp < minTime {
+
+		newChunk, _, newAppender, err := appender.AppendFloatHistogram(nil, timestamp, fh, false)
+		if err != nil {
+			return nil, fmt.Errorf("appending FloatHistogram to chunk: %w", err)
+		}
+
+		if newChunk != nil {
+			currentChunk.Compact()
+			chunks = append(chunks, storepb.AggrChunk{
+				MinTime: minTime,
+				MaxTime: maxTime,
+				Raw: &storepb.Chunk{
+					Type: storepb.Chunk_FLOAT_HISTOGRAM,
+					Data: currentChunk.Bytes(),
+				},
+			})
+
+			fhChunk, ok := newChunk.(*chunkenc.FloatHistogramChunk)
+			if !ok {
+				return nil, fmt.Errorf("unexpected chunk type %T", newChunk)
+			}
+			currentChunk = fhChunk
+			appender = newAppender
 			minTime = timestamp
-		}
-		if timestamp > maxTime {
 			maxTime = timestamp
+		} else {
+			appender = newAppender
+			if timestamp < minTime {
+				minTime = timestamp
+			}
+			if timestamp > maxTime {
+				maxTime = timestamp
+			}
 		}
 	}
-	fhChunk.Compact()
 
-	return storepb.AggrChunk{
-		MinTime: minTime,
-		MaxTime: maxTime,
-		Raw: &storepb.Chunk{
-			Type: storepb.Chunk_FLOAT_HISTOGRAM,
-			Data: fhChunk.Bytes(),
-		},
-	}, nil
+	if currentChunk != nil {
+		currentChunk.Compact()
+		chunks = append(chunks, storepb.AggrChunk{
+			MinTime: minTime,
+			MaxTime: maxTime,
+			Raw: &storepb.Chunk{
+				Type: storepb.Chunk_FLOAT_HISTOGRAM,
+				Data: currentChunk.Bytes(),
+			},
+		})
+	}
+
+	return chunks, nil
 }
