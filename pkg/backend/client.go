@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	authcredentials "cloud.google.com/go/auth/credentials"
@@ -84,6 +85,162 @@ func (rt *HeaderRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	return rt.base.RoundTrip(outgoing)
 }
 
+type RetryRoundTripper struct {
+	base       http.RoundTripper
+	maxRetries int
+}
+
+func NewRetryRoundTripper(base http.RoundTripper, maxRetries int) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	return &RetryRoundTripper{
+		base:       base,
+		maxRetries: maxRetries,
+	}
+}
+
+func (rt *RetryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+
+	for attempt := 0; attempt <= rt.maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(100*(1<<attempt)) * time.Millisecond
+			select {
+			case <-req.Context().Done():
+				if resp != nil {
+					return resp, nil
+				}
+				return nil, req.Context().Err()
+			case <-time.After(backoff):
+			}
+
+			if req.GetBody != nil {
+				newBody, err := req.GetBody()
+				if err == nil {
+					req.Body = newBody
+				}
+			}
+		}
+
+		resp, err = rt.base.RoundTrip(req)
+		if err != nil {
+			if req.Context().Err() != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests ||
+			resp.StatusCode == http.StatusBadGateway ||
+			resp.StatusCode == http.StatusServiceUnavailable ||
+			resp.StatusCode == http.StatusGatewayTimeout {
+			if attempt < rt.maxRetries {
+				resp.Body.Close()
+				continue
+			}
+		}
+
+		return resp, nil
+	}
+
+	return resp, err
+}
+
+type RateLimiter struct {
+	qps       float64
+	burst     float64
+	tokens    float64
+	lastCheck time.Time
+	mu        sync.Mutex
+}
+
+func NewRateLimiter(qps float64, burst int) *RateLimiter {
+	return &RateLimiter{
+		qps:       qps,
+		burst:     float64(burst),
+		tokens:    float64(burst),
+		lastCheck: time.Now(),
+	}
+}
+
+func (rl *RateLimiter) Wait(ctx context.Context) error {
+	rl.mu.Lock()
+	now := time.Now()
+	elapsed := now.Sub(rl.lastCheck).Seconds()
+	rl.lastCheck = now
+	rl.tokens += elapsed * rl.qps
+	if rl.tokens > rl.burst {
+		rl.tokens = rl.burst
+	}
+
+	if rl.tokens >= 1.0 {
+		rl.tokens -= 1.0
+		rl.mu.Unlock()
+		return nil
+	}
+
+	needed := 1.0 - rl.tokens
+	sleepDuration := time.Duration(needed / rl.qps * float64(time.Second))
+	rl.tokens = 0
+	rl.mu.Unlock()
+
+	select {
+	case <-time.After(sleepDuration):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type RateLimiterRoundTripper struct {
+	base    http.RoundTripper
+	limiter *RateLimiter
+	sem     chan struct{}
+}
+
+func NewRateLimiterRoundTripper(base http.RoundTripper, qps float64, burst int, maxConcurrency int) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if maxConcurrency <= 0 {
+		maxConcurrency = 5
+	}
+	if qps <= 0 {
+		qps = 5
+	}
+	if burst <= 0 {
+		burst = 5
+	}
+
+	return &RateLimiterRoundTripper{
+		base:    base,
+		limiter: NewRateLimiter(qps, burst),
+		sem:     make(chan struct{}, maxConcurrency),
+	}
+}
+
+func (rt *RateLimiterRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+
+	select {
+	case rt.sem <- struct{}{}:
+		defer func() { <-rt.sem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	if err := rt.limiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	return rt.base.RoundTrip(req)
+}
+
 func NewQueryBackendRoundTripper(queryConfig config.QueryBackendConfig) (http.RoundTripper, error) {
 	transport := http.RoundTripper(http.DefaultTransport)
 	if QueryAuthEnabled(queryConfig.Auth) {
@@ -100,7 +257,9 @@ func NewQueryBackendRoundTripper(queryConfig config.QueryBackendConfig) (http.Ro
 		transport = client.Transport
 	}
 
-	return NewHeaderRoundTripper(transport, queryConfig.Headers), nil
+	transport = NewHeaderRoundTripper(transport, queryConfig.Headers)
+	transport = NewRateLimiterRoundTripper(transport, 5, 5, 5)
+	return NewRetryRoundTripper(transport, 3), nil
 }
 
 func QueryAuthEnabled(auth config.QueryBackendAuthConfig) bool {

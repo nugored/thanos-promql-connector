@@ -59,10 +59,16 @@ var (
 		"Maximum backend query_range points per series for StoreAPI series requests. The connector increases the backend step for long ranges when needed. Set 0 to disable connector-side clamping; backend limits still apply.")
 	queryLabelCacheTTL = flag.Duration("query.label-cache-ttl", 5*time.Minute,
 		"How long to cache backend label matcher search results for external label queries. Set 0 to disable caching.")
+	queryLabelCacheMaxEntries = flag.Int("query.label-cache-max-entries", 10000,
+		"Maximum entries in label matcher search cache. Set 0 for unlimited.")
 	queryLabelNamesCacheTTL = flag.Duration("query.label-names-cache-ttl", 5*time.Minute,
 		"How long to cache backend LabelNames search results. Set 0 to disable caching.")
+	queryLabelNamesCacheMaxEntries = flag.Int("query.label-names-cache-max-entries", 10000,
+		"Maximum entries in LabelNames search cache. Set 0 for unlimited.")
 	queryLabelValuesCacheTTL = flag.Duration("query.label-values-cache-ttl", 5*time.Minute,
 		"How long to cache backend LabelValues search results. Set 0 to disable caching.")
+	queryLabelValuesCacheMaxEntries = flag.Int("query.label-values-cache-max-entries", 10000,
+		"Maximum entries in LabelValues search cache. Set 0 for unlimited.")
 	connectorAddress = flag.String("connector-address", ":8081",
 		"Address on which to expose the query grpc server.")
 	grpcServerTLSCertFile = flag.String("grpc-server-tls-cert", "",
@@ -75,6 +81,8 @@ var (
 		"API support to advertise in the Info response. Valid values: store, query, both.")
 	grpcInfoAdvertiseQueryAPI = flag.Bool("grpc-info-advertise-query-api", false,
 		"Deprecated: advertise both StoreAPI and QueryAPI support in the Info response when grpc-info-api-mode is left as store.")
+	logLevel = flag.String("log.level", "info",
+		"Log level. Valid values: debug, info, warn, error. Can also be set via LOG_LEVEL or LOGGING_LEVEL environment variables.")
 	metricsAddress = flag.String("metrics-address", ":9090",
 		"Address on which to expose metrics")
 )
@@ -91,7 +99,16 @@ func init() {
 
 func main() {
 	flag.Parse()
+
+	logLevelVal := *logLevel
+	if envVal := os.Getenv("LOG_LEVEL"); envVal != "" {
+		logLevelVal = envVal
+	} else if envVal := os.Getenv("LOGGING_LEVEL"); envVal != "" {
+		logLevelVal = envVal
+	}
+
 	logger := log.NewJSONLogger(log.NewSyncWriter(os.Stderr))
+	logger = level.NewFilter(logger, level.Allow(level.ParseDefault(logLevelVal, level.InfoValue())))
 	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
 	logger = log.With(logger, "caller", log.DefaultCaller)
 
@@ -244,6 +261,7 @@ func main() {
 	queryBackendDescription := queryConfig.QueryTargetURL
 	infoExternalLabels := externalLabelsForRequests
 	infoAnnouncedLabelSets := announcedLabelSets.LabelSets
+	var queryServer *server.QueryServer
 	if len(gcpProjects) > 0 {
 		queryBackendDescription = "gcp-projects:" + strings.Join(gcpProjects, ",")
 		infoExternalLabels = labels.EmptyLabels
@@ -335,7 +353,7 @@ func main() {
 			os.Exit(1)
 		}
 		grpcServer := grpc.NewServer(serverOptions...)
-		queryServer := server.NewQueryServerWithCacheTTLs(queryBackends, queryDropLabels.Values(), *querySeriesStep, *queryMaxPointsPerSeries, *queryLabelCacheTTL, *queryLabelNamesCacheTTL, *queryLabelValuesCacheTTL)
+		queryServer = server.NewQueryServerWithCacheConfig(logger, queryBackends, queryDropLabels.Values(), *querySeriesStep, *queryMaxPointsPerSeries, *queryLabelCacheTTL, *queryLabelNamesCacheTTL, *queryLabelValuesCacheTTL, *queryLabelCacheMaxEntries, *queryLabelNamesCacheMaxEntries, *queryLabelValuesCacheMaxEntries)
 		storepb.RegisterStoreServer(grpcServer, queryServer)
 		querypb.RegisterQueryServer(grpcServer, queryServer)
 		infopb.RegisterInfoServer(grpcServer, &server.InfoServer{
@@ -349,6 +367,24 @@ func main() {
 			return grpcServer.Serve(listener)
 		}, func(err error) {
 			grpcServer.GracefulStop()
+		})
+	}
+	{
+		// Cache cleanup routine
+		ctx, cancel := context.WithCancel(context.Background())
+		g.Add(func() error {
+			ticker := time.NewTicker(2 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					queryServer.PurgeExpiredCaches()
+				case <-ctx.Done():
+					return nil
+				}
+			}
+		}, func(err error) {
+			cancel()
 		})
 	}
 	{
